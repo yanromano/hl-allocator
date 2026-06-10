@@ -1,0 +1,36 @@
+## hl-allocator — neutral example configuration
+## Copy to automation.yaml (gitignored) and fill in real values.
+## Never commit a file containing real keys, addresses, or signal URLs.
+## Agent key: either an encrypted V3 keystore (key_source.type: keystore, the
+## default) or the HL_AGENT_KEY environment variable (key_source.type: env_raw).
+
+env: testnet
+subaccount_address: "0x0000000000000000000000000000000000000000"  # set after provisioning
+
+signal_source:
+  type: equal_weight       # remote | equal_weight | single_asset
+  # url: "https://signals.example.com/allocations"          # remote only
+  # token_ref: "HL_SIGNAL_BEARER"            # remote only — env var NAME holding the Bearer token
+  # root_key_fingerprint_ref: "HL_SIGNAL_ROOT_FP"  # mainnet+remote: env var NAME holding the pinned root fingerprint (required)
+  client_id: "client-local"
+
+rebalance_utc_time: "00:15"
+
+threshold_pct: 3.0        # skip orders smaller than 3 pp allocation change
+max_per_asset: 0.5        # cap any single coin at 50 % of equity
+
+caps:
+  max_notional_per_coin: 10000.0   # USD
+  max_total_notional: 50000.0      # USD
+  max_turnover_per_cycle: 60000.0  # USD (buys + sells per rebalance)
+  max_order_slippage: 0.01         # 1 % max slippage per order
+
+safety_buffer: 0.03        # keep 3 % equity as free margin
+max_signal_staleness_days: 2
+
+# HAARP coin ticker → Hyperliquid perpetual name.
+# Neutral example: BTC + ETH only.
+# Real universe provisioned separately; never commit it to the public repo.
+universe_perp_map:
+  BTC: BTC
+  ETH: ETH

@@ -1,0 +1,55 @@
+env: testnet                       # or mainnet
+trade_mode: master_direct          # the client's own HL account
+subaccount_address: "0xYOUR_HL_ACCOUNT_ADDRESS"
+
+# Signal: the operator's signed-allocation endpoint.
+signal_source:
+  type: remote
+  url: "https://signals.example.com/allocation"
+  token_ref: "HL_SIGNAL_BEARER"            # env var holding the Bearer token
+  root_key_fingerprint_ref: "HL_SIGNAL_ROOT_FP"  # env var holding the pinned root fingerprint
+  client_id: "your-client-id"
+
+# Agent key: paste the trade-only key (generated in the HL UI) into this env var.
+key_source:
+  type: env_raw
+  env_var: HL_AGENT_KEY
+
+# Coins the engine may trade: signal coin -> Hyperliquid perp name.
+# Must match your signal subscription's universe.
+universe_perp_map:
+  BTC: BTC
+  ETH: ETH
+
+# State files on the Railway volume.
+data_dir: /data
+state_path: state.json
+nonce_state_path: nonce.state
+ledger_path: ledger.json
+audit_path: audit.jsonl
+kill_flag_path: KILL
+
+# Liveness.
+health:
+  enabled: true
+  http_port: 8080
+  heartbeat_max_silence_seconds: 180
+
+# Risk / execution defaults (tune to taste).
+max_per_asset: 0.9
+caps:
+  max_notional_per_coin: 10000.0
+  max_total_notional: 50000.0
+  max_turnover_per_cycle: 60000.0
+  max_order_slippage: 0.01
+rebalance_utc_time: "00:15"
+threshold_pct: 3.0
+target_leverage: 1
+leverage_is_cross: false
+set_leverage_on_boot: true
+enforce_leverage_on_drift: true
+retry:
+  enabled: true
+  interval_seconds: 600
+  window_seconds: 10800
+  liquidity_safety: 1.0

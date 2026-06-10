@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+run/
+build/
+automation.yaml
+*.state
+*.state.bak
+secrets/
+state.json
+ledger.json
+audit.jsonl
+remote_signal_state.json
+dist/
+*.egg-info/
+.env

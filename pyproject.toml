@@ -1,0 +1,32 @@
+[project]
+name = "hl-allocator"
+version = "0.1.0"
+description = "Self-hosted Hyperliquid allocation execution engine (signed-signal consumer)."
+requires-python = ">=3.14"
+dependencies = [
+    "hyperliquid-python-sdk",
+    "eth-account",
+    "httpx",
+    "pydantic>=2",
+    "pynacl",
+    "pyyaml",
+    "keyring",
+    "filelock",
+    "structlog",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "ruff"]
+
+[project.scripts]
+hl-allocator = "automation.scripts.run_daemon:main"
+hl-leverage-guard = "automation.scripts.leverage_guard:main"
+hl-health = "automation.scripts.position_health:main"
+
+[tool.setuptools.packages.find]
+include = ["automation*"]
+exclude = ["automation.tests*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

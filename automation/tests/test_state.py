@@ -1,0 +1,248 @@
+"""
+Tests for automation.reporting.state — persistent executor state.
+
+Coverage:
+- round-trip (save + load returns identical State)
+- missing file → fresh defaults
+- corrupt file → StateError (never silently reset)
+- atomic-replace leaves no .tmp behind
+- saved file is valid JSON
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from automation.reporting.state import State, StateError, load, save
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_state(
+    target: dict[str, float] | None = None,
+    as_of: str | None = None,
+) -> State:
+    return State(
+        last_rebalanced_target=target,
+        last_rebalanced_as_of=as_of,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestStateLoad:
+    def test_missing_file_returns_defaults(self, tmp_path: Path) -> None:
+        """A missing state file yields a fresh State with all defaults."""
+        path = tmp_path / "state.json"
+        state = load(path)
+
+        assert state.last_rebalanced_target is None
+        assert state.last_rebalanced_as_of is None
+        assert state.schema_version == 1
+
+    def test_corrupt_file_raises_state_error(self, tmp_path: Path) -> None:
+        """A corrupt / unparseable JSON file raises StateError, never silently resets."""
+        path = tmp_path / "state.json"
+        path.write_text("NOT VALID JSON {{{", encoding="utf-8")
+
+        with pytest.raises(StateError, match="corrupt or unparseable"):
+            load(path)
+
+    def test_wrong_type_raises_state_error(self, tmp_path: Path) -> None:
+        """JSON with wrong field types raises StateError (pydantic validation failure)."""
+        path = tmp_path / "state.json"
+        # last_rebalanced_target should be dict[str,float]|None, not a list
+        path.write_text(
+            json.dumps({"last_rebalanced_target": [1, 2, 3], "schema_version": 1}),
+            encoding="utf-8",
+        )
+        with pytest.raises(StateError):
+            load(path)
+
+    def test_round_trip_with_target(self, tmp_path: Path) -> None:
+        """save + load round-trips a State with a non-None target correctly."""
+        path = tmp_path / "state.json"
+        original = _make_state(
+            target={"BTC": 0.6, "ETH": 0.4},
+            as_of="2026-06-01",
+        )
+        save(original, path)
+        loaded = load(path)
+
+        assert loaded.last_rebalanced_target == {"BTC": 0.6, "ETH": 0.4}
+        assert loaded.last_rebalanced_as_of == "2026-06-01"
+        assert loaded.schema_version == 1
+
+    def test_round_trip_defaults(self, tmp_path: Path) -> None:
+        """save + load round-trips a freshly-constructed State (all defaults)."""
+        path = tmp_path / "state.json"
+        original = State()
+        save(original, path)
+        loaded = load(path)
+
+        assert loaded.last_rebalanced_target is None
+        assert loaded.last_rebalanced_as_of is None
+        assert loaded.schema_version == 1
+
+
+class TestStateSave:
+    def test_atomic_replace_no_tmp_left(self, tmp_path: Path) -> None:
+        """After save(), no .tmp file remains on disk."""
+        path = tmp_path / "state.json"
+        state = _make_state(target={"BTC": 1.0}, as_of="2026-06-01")
+        save(state, path)
+
+        tmp = Path(str(path) + ".tmp")
+        assert not tmp.exists(), ".tmp file should be cleaned up by os.replace"
+
+    def test_saved_file_is_valid_json(self, tmp_path: Path) -> None:
+        """The saved file is parseable as JSON."""
+        path = tmp_path / "state.json"
+        state = _make_state(target={"ETH": 0.5}, as_of="2026-05-01")
+        save(state, path)
+
+        raw = path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        assert isinstance(parsed, dict)
+        assert "last_rebalanced_target" in parsed
+
+    def test_overwrites_existing_file(self, tmp_path: Path) -> None:
+        """A second save() correctly overwrites the first."""
+        path = tmp_path / "state.json"
+
+        first = _make_state(target={"BTC": 0.5}, as_of="2026-05-01")
+        save(first, path)
+
+        second = _make_state(target={"ETH": 0.9}, as_of="2026-06-01")
+        save(second, path)
+
+        loaded = load(path)
+        assert loaded.last_rebalanced_target == {"ETH": 0.9}
+        assert loaded.last_rebalanced_as_of == "2026-06-01"
+
+    def test_save_none_target(self, tmp_path: Path) -> None:
+        """Saving a State with None target persists and loads back as None."""
+        path = tmp_path / "state.json"
+        state = State()  # last_rebalanced_target=None
+        save(state, path)
+        loaded = load(path)
+        assert loaded.last_rebalanced_target is None
+
+
+class TestLastSuccessfulSignalTs:
+    def test_defaults_to_none(self) -> None:
+        """Fresh State must have last_successful_signal_ts=None."""
+        state = State()
+        assert state.last_successful_signal_ts is None
+
+    def test_round_trip_none(self, tmp_path: Path) -> None:
+        """A State with last_successful_signal_ts=None round-trips correctly."""
+        path = tmp_path / "state.json"
+        state = State()
+        save(state, path)
+        loaded = load(path)
+        assert loaded.last_successful_signal_ts is None
+
+    def test_round_trip_set(self, tmp_path: Path) -> None:
+        """A State with last_successful_signal_ts set round-trips correctly."""
+        path = tmp_path / "state.json"
+        ts = "2026-06-01T00:15:00+00:00"
+        state = State(last_successful_signal_ts=ts)
+        save(state, path)
+        loaded = load(path)
+        assert loaded.last_successful_signal_ts == ts
+
+    def test_missing_field_in_legacy_file_defaults_to_none(self, tmp_path: Path) -> None:
+        """A state file without last_successful_signal_ts loads with None (forward compat)."""
+        import json
+
+        path = tmp_path / "state.json"
+        # Simulate a legacy state file that predates this field.
+        legacy = {
+            "last_rebalanced_target": {"BTC": 0.5},
+            "last_rebalanced_as_of": "2026-05-01",
+            "schema_version": 1,
+            "last_scheduled_as_of": "2026-05-01",
+        }
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        loaded = load(path)
+        assert loaded.last_successful_signal_ts is None
+        assert loaded.last_rebalanced_target == {"BTC": 0.5}
+
+
+class TestFirstCycleTs:
+    def test_defaults_to_none(self) -> None:
+        """Fresh State must have first_cycle_ts=None."""
+        state = State()
+        assert state.first_cycle_ts is None
+
+    def test_round_trip_none(self, tmp_path: Path) -> None:
+        """A State with first_cycle_ts=None round-trips correctly."""
+        path = tmp_path / "state.json"
+        state = State()
+        save(state, path)
+        loaded = load(path)
+        assert loaded.first_cycle_ts is None
+
+    def test_round_trip_set(self, tmp_path: Path) -> None:
+        """A State with first_cycle_ts set round-trips correctly."""
+        path = tmp_path / "state.json"
+        ts = "2026-06-01T00:15:00+00:00"
+        state = State(first_cycle_ts=ts)
+        save(state, path)
+        loaded = load(path)
+        assert loaded.first_cycle_ts == ts
+
+    def test_missing_field_in_legacy_file_defaults_to_none(self, tmp_path: Path) -> None:
+        """A state file without first_cycle_ts loads with None (forward compat)."""
+        import json
+
+        path = tmp_path / "state.json"
+        legacy = {
+            "last_rebalanced_target": {"BTC": 0.5},
+            "last_rebalanced_as_of": "2026-05-01",
+            "schema_version": 1,
+            "last_scheduled_as_of": "2026-05-01",
+            "last_successful_signal_ts": "2026-05-01T00:00:00+00:00",
+        }
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        loaded = load(path)
+        assert loaded.first_cycle_ts is None
+        assert loaded.last_rebalanced_target == {"BTC": 0.5}
+
+
+class TestRetryFields:
+    def test_state_retry_fields_default_idle(self, tmp_path: Path) -> None:
+        """Fresh State must have all retry fields at their IDLE defaults."""
+        s = State()
+        assert s.retry_as_of is None
+        assert s.retry_target is None
+        assert s.retry_window_start is None
+        assert s.retry_last_attempt is None
+        assert s.retry_attempt_count == 0
+
+    def test_state_retry_fields_roundtrip(self, tmp_path: Path) -> None:
+        """Retry fields survive a save/load round-trip with full fidelity."""
+        p = tmp_path / "state.json"
+        s = State(
+            retry_as_of="2026-05-17",
+            retry_target={"TON": 0.5, "HYPE": 0.075},
+            retry_window_start="2026-05-18T00:15:00+00:00",
+            retry_last_attempt="2026-05-18T00:15:00+00:00",
+            retry_attempt_count=2,
+        )
+        save(s, p)
+        loaded = load(p)
+        assert loaded.retry_as_of == "2026-05-17"
+        assert loaded.retry_target == {"TON": 0.5, "HYPE": 0.075}
+        assert loaded.retry_window_start == "2026-05-18T00:15:00+00:00"
+        assert loaded.retry_last_attempt == "2026-05-18T00:15:00+00:00"
+        assert loaded.retry_attempt_count == 2
