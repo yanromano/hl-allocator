@@ -196,6 +196,59 @@ def test_per_source_staleness() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-source model_rev pin (each sleeve consumes a DIFFERENT signal)
+# ---------------------------------------------------------------------------
+
+
+def test_per_source_pinned_model_rev() -> None:
+    """A sleeve with pinned_model_rev uses it; otherwise the global.
+
+    Two sleeves consume different signals (HAARP NOGATE rev vs CRASH gated rev),
+    so a single global pin can never match both — the per-sleeve override is the
+    only way to pin both correctly.
+    """
+    raw = _raw()
+    raw.pop("signal_source", None)
+    raw["pinned_model_rev"] = "haarp-rev"  # the global fallback
+    crash = _remote_sleeve("crash", 0.5, allow_short=True)
+    crash["pinned_model_rev"] = "crash-rev"  # per-source override
+    raw["signal_sources"] = [
+        _remote_sleeve("haarp", 0.5, allow_short=False),  # no per-source key
+        crash,
+    ]
+    c = Config(**raw)
+    haarp_sleeve, crash_sleeve = c.sleeves()
+    assert crash_sleeve.pinned_model_rev == "crash-rev"
+    assert haarp_sleeve.pinned_model_rev is None
+    # effective value: per-source override wins, else the global default
+    assert c.effective_pinned_model_rev(crash_sleeve) == "crash-rev"
+    assert c.effective_pinned_model_rev(haarp_sleeve) == "haarp-rev"
+
+
+def test_pinned_model_rev_no_global_no_override_is_none() -> None:
+    """No global pin and no per-sleeve pin ⇒ effective pin is None (accept any)."""
+    raw = _raw()
+    raw.pop("signal_source", None)
+    raw.pop("pinned_model_rev", None)
+    raw["signal_sources"] = [_remote_sleeve("haarp", 1.0, allow_short=False)]
+    c = Config(**raw)
+    (sleeve,) = c.sleeves()
+    assert c.effective_pinned_model_rev(sleeve) is None
+
+
+def test_singular_default_sleeve_inherits_global_pin() -> None:
+    """The singular signal_source: path (default sleeve) inherits the top-level
+    pin via the fallback — preserving today's NOGATE-TEST defense unchanged."""
+    raw = _raw()  # keeps the singular signal_source: block
+    raw["pinned_model_rev"] = "prod-rev"
+    c = Config(**raw)
+    (default_sleeve,) = c.sleeves()
+    assert default_sleeve.name == "default"
+    assert default_sleeve.pinned_model_rev is None
+    assert c.effective_pinned_model_rev(default_sleeve) == "prod-rev"
+
+
+# ---------------------------------------------------------------------------
 # Per-source mainnet-remote rule
 # ---------------------------------------------------------------------------
 

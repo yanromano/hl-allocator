@@ -34,7 +34,7 @@ from automation.core.config import CapsConfig, Config, RetryConfig, SignalSource
 from automation.reporting.alerts import Alert, AlertType, Severity
 from automation.reporting.state import State
 from automation.runtime.intent_ledger import IntentLedger
-from automation.runtime.rebalance import _FrozenSource, run_cycle
+from automation.runtime.rebalance import _fetch_sleeve, _FrozenSource, run_cycle
 from automation.tests._fakes import FakeHLClient
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,70 @@ class _RaisingSource:
 
     def get_target_allocation(self, as_of: Any = None) -> TargetAllocation:
         raise self._exc
+
+
+class _RevSource:
+    """Serves a fixed ``TargetAllocation`` with a configurable ``model_rev``."""
+
+    def __init__(self, model_rev: str, client_id: str) -> None:
+        self._ta = TargetAllocation(
+            as_of=datetime.date(2026, 6, 1),
+            weights={"BTC": 0.3},
+            cash=0.7,
+            strategy_id="strat",
+            model_rev=model_rev,
+            audience=client_id,
+        )
+
+    def get_target_allocation(self, as_of: Any = None) -> TargetAllocation:
+        return self._ta
+
+
+class TestPerSleevePin:
+    """The model_rev pin is resolved PER SLEEVE: each sleeve consumes a
+    different signal (HAARP NOGATE rev vs CRASH gated rev), so a single global
+    pin cannot match both.  ``_fetch_sleeve`` must use
+    ``cfg.effective_pinned_model_rev(sleeve)``."""
+
+    _AS_OF = datetime.date(2026, 6, 1)
+
+    def test_each_sleeve_accepts_its_own_rev(self) -> None:
+        cfg = _two_sleeve_cfg()
+        haarp, crash = cfg.sleeves()
+        haarp = haarp.model_copy(update={"pinned_model_rev": "haarp-rev"})
+        crash = crash.model_copy(update={"pinned_model_rev": "crash-rev"})
+        fh = _fetch_sleeve(
+            cfg=cfg, sleeve=haarp,
+            source=_RevSource("haarp-rev", "haarp-client"), as_of=self._AS_OF,
+        )
+        fc = _fetch_sleeve(
+            cfg=cfg, sleeve=crash,
+            source=_RevSource("crash-rev", "crash-client"), as_of=self._AS_OF,
+        )
+        assert fh.served_ok and not fh.is_rejected
+        assert fc.served_ok and not fc.is_rejected
+
+    def test_wrong_rev_is_rejected_on_that_sleeve(self) -> None:
+        cfg = _two_sleeve_cfg()
+        haarp, _ = cfg.sleeves()
+        haarp = haarp.model_copy(update={"pinned_model_rev": "haarp-rev"})
+        # The HAARP sleeve is served the CRASH rev → mismatch → AllocationRejected.
+        f = _fetch_sleeve(
+            cfg=cfg, sleeve=haarp,
+            source=_RevSource("crash-rev", "haarp-client"), as_of=self._AS_OF,
+        )
+        assert not f.served_ok and f.is_rejected
+
+    def test_sleeve_override_beats_global_pin(self) -> None:
+        # Global pin would reject the CRASH rev; the per-sleeve override rescues it.
+        cfg = _two_sleeve_cfg().model_copy(update={"pinned_model_rev": "haarp-rev"})
+        _, crash = cfg.sleeves()
+        crash = crash.model_copy(update={"pinned_model_rev": "crash-rev"})
+        f = _fetch_sleeve(
+            cfg=cfg, sleeve=crash,
+            source=_RevSource("crash-rev", "crash-client"), as_of=self._AS_OF,
+        )
+        assert f.served_ok and not f.is_rejected
 
 
 def _alerts_of(sink: Any, alert_type: AlertType) -> list[Alert]:

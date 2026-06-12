@@ -361,7 +361,8 @@ def _fetch_sleeve(
         whitelist (RemoteSignalSource also self-validates with the same args — the
         re-validation here is a no-op for it but is the ONLY gate for the local
         ``equal_weight`` / test sources);
-      * enforce the ``cfg.pinned_model_rev`` pin (remote NOGATE-TEST defense).
+      * enforce the per-sleeve ``cfg.effective_pinned_model_rev(sleeve)`` pin
+        (remote NOGATE-TEST defense; falls back to the global pin).
 
     Never raises: any fetch/validation failure is captured into the returned
     ``_SleeveFetch`` (``served_ok=False``) so the caller can apply the per-sleeve
@@ -387,10 +388,11 @@ def _fetch_sleeve(
         # its own pin at fetch; remote payloads had NO rev defense until this check).
         # Mismatch routes through the AllocationRejected path (S-11: present-but-
         # untrusted — the freshness clock does NOT advance).
-        if cfg.pinned_model_rev is not None and ta.model_rev != cfg.pinned_model_rev:
+        pin = cfg.effective_pinned_model_rev(sleeve)
+        if pin is not None and ta.model_rev != pin:
             raise AllocationRejected(
                 f"model_rev pin mismatch: served '{ta.model_rev}' != pinned "
-                f"'{cfg.pinned_model_rev}'"
+                f"'{pin}' (sleeve '{sleeve.name}')"
             )
     except AllocationRejected as exc:
         _logger.warning(

@@ -76,6 +76,14 @@ class SignalSourceConfig(BaseModel):
     fall back to the top-level :attr:`Config.max_signal_staleness_days`.  Resolve
     the effective value via :meth:`Config.effective_staleness_days`."""
 
+    pinned_model_rev: str | None = None
+    """Per-sleeve override for the served-allocation ``model_rev`` pin (the
+    NOGATE-TEST defense).  ``None`` ⇒ fall back to the top-level
+    :attr:`Config.pinned_model_rev`.  Each sleeve consumes a DIFFERENT signal
+    (e.g. HAARP ``…-NOGATE-TEST`` vs CRASH gated rev), so a single global pin
+    cannot match both — set this per-sleeve.  Resolve via
+    :meth:`Config.effective_pinned_model_rev`."""
+
 
 class KeySourceConfig(BaseModel):
     """Where the agent key comes from.
@@ -717,3 +725,16 @@ class Config(BaseModel):
         if sleeve.max_signal_staleness_days is not None:
             return sleeve.max_signal_staleness_days
         return self.max_signal_staleness_days
+
+    def effective_pinned_model_rev(self, sleeve: SignalSourceConfig) -> str | None:
+        """Resolve the effective ``model_rev`` pin for ``sleeve``.
+
+        The per-sleeve :attr:`SignalSourceConfig.pinned_model_rev` wins when set;
+        otherwise fall back to the global :attr:`pinned_model_rev`.  ``None`` at
+        both levels means no pin (any served rev is accepted).  The singular
+        ``"default"`` sleeve carries no per-sleeve pin, so it transparently
+        inherits the top-level value — preserving today's behaviour.
+        """
+        if sleeve.pinned_model_rev is not None:
+            return sleeve.pinned_model_rev
+        return self.pinned_model_rev
