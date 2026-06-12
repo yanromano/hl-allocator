@@ -155,6 +155,52 @@ def should_retry(
     return since >= interval_seconds
 
 
+def should_recheck_signal(
+    *,
+    now: datetime.datetime,
+    recheck_as_of: str | None,
+    recheck_window_start: str | None,
+    recheck_last_attempt: str | None,
+    interval_seconds: int,
+    window_seconds: int,
+) -> bool:
+    """Pure decision: may the daemon RE-FIRE a no-signal re-check now?
+
+    Unlike ``should_retry`` this gates the FIRE branch of ``run_once`` (the
+    restore made ``should_fire`` ready again); the as_of match is implied by
+    the caller comparing ``as_of == state.recheck_as_of`` (SP3 §5 — gate
+    placement).  No side effects; all timing via ``now``.
+
+    Parameters
+    ----------
+    now:
+        Current time.  MUST be tz-aware.
+    recheck_as_of:
+        The ``as_of`` date string the pending re-check targets (e.g.
+        ``"2026-06-10"``).  ``None`` means no re-check is pending.
+    recheck_window_start:
+        ISO datetime string of when the re-check window opened (i.e. when
+        the signal was first found absent).  ``None`` means no window is open.
+    recheck_last_attempt:
+        ISO datetime string of the most recent re-check attempt.  ``None``
+        means no attempt has been made yet.
+    interval_seconds:
+        Minimum seconds to wait between consecutive re-check attempts.
+    window_seconds:
+        Total duration of the re-check window from ``recheck_window_start``;
+        once this has elapsed the window is closed and no further re-checks
+        fire.
+    """
+    if recheck_as_of is None or recheck_window_start is None or recheck_last_attempt is None:
+        return False
+    start = datetime.datetime.fromisoformat(recheck_window_start)
+    if (now.astimezone(datetime.UTC) - start.astimezone(datetime.UTC)).total_seconds() > window_seconds:
+        return False
+    last = datetime.datetime.fromisoformat(recheck_last_attempt)
+    since = (now.astimezone(datetime.UTC) - last.astimezone(datetime.UTC)).total_seconds()
+    return since >= interval_seconds
+
+
 def should_fire(
     now: datetime.datetime,
     last_scheduled_as_of: str | None,

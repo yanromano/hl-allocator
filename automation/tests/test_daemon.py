@@ -85,6 +85,14 @@ class _FakeCfg:
         window_seconds: int = 10800
         liquidity_safety: float = 1.0
 
+    class signal_recheck:
+        # No-signal re-check knobs (mirrors automation.core.config.SignalRecheckConfig
+        # defaults, SP3 §5).  ``enabled=True`` so the recheck tests exercise the
+        # branch; interval 180 s (3 min), window 7 200 s (2 h).
+        enabled: bool = True
+        interval_seconds: int = 180
+        window_seconds: int = 7200
+
 
 class _FakeSource:
     def get_target_allocation(self, as_of: Any = None) -> Any:
@@ -1046,6 +1054,45 @@ class TestDaemonBootLeverage:
         drift = [a for a in sink.received if a.type == AlertType.LEVERAGE_DRIFT]
         assert len(drift) == 1 and drift[0].context["coin"] == "BTC"
         assert client.leverage_calls == [("BTC", 1, False), ("ETH", 1, False)]
+
+    def test_boot_leverage_set_applies_to_held_short(self, tmp_path: Path) -> None:
+        """Boot leverage reconciliation is direction-blind: a coin held SHORT (szi < 0)
+        with correct leverage type and value is classified 'ok' and update_leverage is
+        still called for it — no sign-check or direction branch crash.
+
+        Spec §5 (plan task B5): ``update_leverage`` is per-coin, direction-blind,
+        and operates identically whether the held position is long or short.
+        This test pins that invariant so any accidental sign-guard in the boot
+        path would be caught immediately.
+        """
+        from automation.tests._fakes import FakeHLClient  # noqa: PLC0415
+
+        # ETH held SHORT at the target leverage/mode — should land in 'ok' and still
+        # receive update_leverage (the boot path calls it for every tradeable coin).
+        client = FakeHLClient(
+            positions={"ETH": -2.0},  # negative szi = short
+            positions_leverage={"ETH": {"type": "isolated", "value": 1}},
+        )
+        d = self._make_lev_daemon(tmp_path, _CfgLeverage, client)
+        d.boot("2026-06-10T00:00:00")
+
+        # update_leverage must be called for ETH regardless of its position direction.
+        # BTC has no held position but is tradeable → also gets the default set.
+        coins_levered = {coin for coin, _lev, _cross in client.leverage_calls}
+        assert "ETH" in coins_levered, (
+            "boot must call update_leverage for ETH even though its position is short"
+        )
+        # Confirm no unhandled exception was raised (implicit: we reached here).
+        # Check the ETH call carries the target params: leverage=1, is_cross=False.
+        eth_calls = [
+            (lev, cross)
+            for coin, lev, cross in client.leverage_calls
+            if coin == "ETH"
+        ]
+        assert eth_calls == [(1, False)], (
+            "update_leverage for a short position must use the same target params as "
+            "for a long — no direction branching"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2462,3 +2509,395 @@ class TestDaemonHeartbeat:
         assert result is None  # HALT: kill guard returned None, no cycle fired
         # Killed-but-alive daemon stays HEALTHY (beat landed before the guard).
         assert hb.is_healthy(now_ts="2026-05-18T00:15:01+00:00") is True
+
+
+# ---------------------------------------------------------------------------
+# SP3 §5 — no-signal re-fire: bounded re-check window
+# ---------------------------------------------------------------------------
+
+
+def _no_signal_hold_report() -> CycleReport:
+    """The EXACT no-good-signal HOLD shape returned by
+    ``rebalance._handle_no_good_signal`` within the staleness window:
+    uncommitted, structurally zero orders (``exec_report=None`` — the executor
+    was never reached), ``signal_ok=False``, NOT deferred."""
+    return CycleReport(
+        rebalanced=False,
+        reason="hold_stale_within_window",
+        exec_report=None,
+        unresolved_pending=[],
+        committed=False,
+        signal_ok=False,
+        derisked=False,
+        data_age_days=-1,
+    )
+
+
+def _derisk_report() -> CycleReport:
+    """A de-risk-to-cash report: the staleness clock expired and the cycle
+    flattened — ``committed=True`` (that day ACTED), ``signal_ok=False``."""
+    return CycleReport(
+        rebalanced=False,
+        reason="derisk_to_cash",
+        exec_report=None,
+        unresolved_pending=[],
+        committed=True,
+        signal_ok=False,
+        derisked=True,
+        data_age_days=-1,
+    )
+
+
+class TestNoSignalRecheck:
+    """SP3 §5 — a NO-GOOD-SIGNAL HOLD must not consume the day: the daemon
+    restores the idempotency key (MF-9 mechanism — zero orders submitted →
+    re-fire is double-trade-safe) and re-checks on a bounded cadence until a
+    non-hold outcome lands or the window expires."""
+
+    _T0 = _dt(2026, 6, 2, 0, 15)  # fire tick → as_of "2026-06-01"
+    _AS_OF = "2026-06-01"
+
+    @staticmethod
+    def _install_counting_hold(monkeypatch: Any) -> dict[str, int]:
+        """Monkeypatch run_cycle with a COUNTING fake that always holds."""
+        calls = {"n": 0}
+
+        def _hold_cycle(*a: Any, **kw: Any) -> CycleReport:
+            calls["n"] += 1
+            return _no_signal_hold_report()
+
+        monkeypatch.setattr(_daemon_mod._rebalance_mod, "run_cycle", _hold_cycle)
+        return calls
+
+    def test_hold_restores_last_scheduled_and_opens_window(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._install_counting_hold(monkeypatch)
+        d, _, _, _, _ = _make_daemon(tmp_path)
+
+        result = d.run_once(self._T0, self._T0.isoformat())
+
+        assert result is not None
+        assert calls["n"] == 1
+        # Idempotency key RESTORED to prev value (None) — day NOT consumed.
+        assert d.state.last_scheduled_as_of is None
+        # Window opened for this as_of, first attempt recorded.
+        assert d.state.recheck_as_of == self._AS_OF
+        assert d.state.recheck_window_start == self._T0.isoformat()
+        assert d.state.recheck_last_attempt == self._T0.isoformat()
+        assert d.state.recheck_attempt_count == 1
+
+    def test_restore_and_window_in_single_persisted_save(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        self._install_counting_hold(monkeypatch)
+        d, _, _, state_path, _ = _make_daemon(tmp_path)
+
+        d.run_once(self._T0, self._T0.isoformat())
+
+        # Reload from DISK: restore AND window fields both present (atomicity
+        # of the combined save — no state where one landed without the other).
+        loaded = load(state_path)
+        assert loaded.last_scheduled_as_of is None
+        assert loaded.recheck_as_of == self._AS_OF
+        assert loaded.recheck_window_start == self._T0.isoformat()
+        assert loaded.recheck_last_attempt == self._T0.isoformat()
+        assert loaded.recheck_attempt_count == 1
+
+    def test_refire_blocked_within_interval(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._install_counting_hold(monkeypatch)
+        d, _, _, _, _ = _make_daemon(tmp_path)
+        d.run_once(self._T0, self._T0.isoformat())
+
+        t1 = self._T0 + datetime.timedelta(seconds=30)  # +30 s < 180 s interval
+        result = d.run_once(t1, t1.isoformat())
+
+        assert result is None
+        assert calls["n"] == 1  # cycle NOT re-run
+        assert d.state.recheck_attempt_count == 1
+        assert d.state.recheck_last_attempt == self._T0.isoformat()  # untouched
+
+    def test_refire_fires_after_interval(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._install_counting_hold(monkeypatch)
+        d, _, _, _, _ = _make_daemon(tmp_path)
+        d.run_once(self._T0, self._T0.isoformat())
+
+        t1 = self._T0 + datetime.timedelta(seconds=181)  # interval+1 s
+        result = d.run_once(t1, t1.isoformat())
+
+        assert result is not None
+        assert calls["n"] == 2  # cycle re-ran
+        assert d.state.recheck_attempt_count == 2
+        assert d.state.recheck_last_attempt == t1.isoformat()
+        # Window start NOT reset on a subsequent hold for the SAME as_of.
+        assert d.state.recheck_window_start == self._T0.isoformat()
+
+    def test_window_expiry_consumes_day_and_alerts(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = self._install_counting_hold(monkeypatch)
+        d, _, sink, state_path, _ = _make_daemon(tmp_path)
+        d.run_once(self._T0, self._T0.isoformat())
+
+        # Exactly window_seconds later: >= semantics (retry_window_expired is
+        # the authoritative expiry check) → consume the day.
+        t_exp = self._T0 + datetime.timedelta(seconds=7200)
+        result = d.run_once(t_exp, t_exp.isoformat())
+
+        assert result is None
+        assert calls["n"] == 1  # NO cycle ran on the expiry tick
+        assert d.state.last_scheduled_as_of == self._AS_OF  # day consumed
+        assert d.state.recheck_as_of is None
+        assert d.state.recheck_window_start is None
+        assert d.state.recheck_last_attempt is None
+        assert d.state.recheck_attempt_count == 0
+        assert d.state.recheck_exhausted_as_of == self._AS_OF
+        ex = [a for a in sink.received if a.type == AlertType.SIGNAL_RECHECK_EXHAUSTED]
+        assert len(ex) == 1
+        assert ex[0].severity == Severity.CRITICAL
+        assert ex[0].context["as_of"] == self._AS_OF
+        assert ex[0].context["attempts"] == 1
+        assert ex[0].context["window_seconds"] == 7200
+        loaded = load(state_path)
+        assert loaded.last_scheduled_as_of == self._AS_OF
+        assert loaded.recheck_exhausted_as_of == self._AS_OF
+
+    def test_stale_window_superseded_on_new_day(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A re-check window is still OPEN for D="2026-05-17" (idempotency key
+        # restored to D-1 by the prior holds), and the NEW day D+1 fires.
+        state = State()
+        state.last_scheduled_as_of = "2026-05-16"
+        state.recheck_as_of = "2026-05-17"
+        state.recheck_window_start = "2026-05-18T23:00:00+00:00"
+        state.recheck_last_attempt = "2026-05-18T23:55:00+00:00"
+        state.recheck_attempt_count = 5
+        d, _, _, state_path, _ = _make_daemon(tmp_path, state=state)
+
+        # Capture-at-call-time fake: record the recheck state AS SEEN INSIDE
+        # run_cycle (in memory AND on disk).  End-state-only assertions cannot
+        # pin the supersede block — the hold path's fresh-open produces the
+        # same final state — so we prove D's window was cleared AND PERSISTED
+        # BEFORE the cycle ran (the on-disk clear is what keeps the boot
+        # crash-detection marker valid during the new day's cycle).
+        seen: dict[str, Any] = {}
+
+        def _capturing_hold(*a: Any, **kw: Any) -> CycleReport:
+            seen["mem_recheck_as_of"] = d.state.recheck_as_of
+            seen["disk_recheck_as_of"] = load(state_path).recheck_as_of
+            return _no_signal_hold_report()
+
+        monkeypatch.setattr(_daemon_mod._rebalance_mod, "run_cycle", _capturing_hold)
+
+        # D+1 fire tick: 2026-05-19 00:15 → expected as_of "2026-05-18".
+        now = _dt(2026, 5, 19, 0, 15)
+        d.run_once(now, now.isoformat())
+
+        # D's window was cleared AND persisted BEFORE run_cycle ran (an empty
+        # ``seen`` would also fail here — the cycle must have fired exactly so).
+        assert seen == {"mem_recheck_as_of": None, "disk_recheck_as_of": None}
+        # The D+1 hold then opened a FRESH window — never inheriting
+        # yesterday's start/attempt clock.
+        assert d.state.recheck_as_of == "2026-05-18"
+        assert d.state.recheck_window_start == now.isoformat()
+        assert d.state.recheck_last_attempt == now.isoformat()
+        assert d.state.recheck_attempt_count == 1
+        # Supersede never touches the exhausted marker.
+        assert d.state.recheck_exhausted_as_of is None
+
+    def test_exception_path_closes_window(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # A window is OPEN from a prior hold and the re-check attempt's
+        # run_cycle RAISES.  The exception path's minimal CycleReport keeps
+        # ``signal_ok=True`` (the default _is_no_signal_hold relies on), so it
+        # is NOT a hold: the day stays consumed (F1 error-loop protection) and
+        # the close branch clears the now-orphaned window.
+        def _boom(*a: Any, **kw: Any) -> CycleReport:
+            raise RuntimeError("exchange down")
+
+        monkeypatch.setattr(_daemon_mod._rebalance_mod, "run_cycle", _boom)
+        state = State()
+        state.last_scheduled_as_of = None  # restored by the prior hold
+        state.recheck_as_of = self._AS_OF
+        state.recheck_window_start = self._T0.isoformat()
+        state.recheck_last_attempt = self._T0.isoformat()
+        state.recheck_attempt_count = 1
+        d, _, _, state_path, _ = _make_daemon(tmp_path, state=state)
+
+        t1 = self._T0 + datetime.timedelta(seconds=181)  # cadence elapsed → re-fire
+        result = d.run_once(t1, t1.isoformat())
+
+        assert result is not None
+        assert result.committed is False
+        # Day stays consumed — the exception path never restores.
+        assert d.state.last_scheduled_as_of == self._AS_OF
+        # The orphaned window is CLOSED (in memory and on disk).
+        assert d.state.recheck_as_of is None
+        assert d.state.recheck_window_start is None
+        assert d.state.recheck_last_attempt is None
+        assert d.state.recheck_attempt_count == 0
+        loaded = load(state_path)
+        assert loaded.recheck_as_of is None
+        assert loaded.last_scheduled_as_of == self._AS_OF
+
+    def test_success_clears_recheck_state(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # First cycle holds (no signal), second re-check gets a GOOD signal.
+        reports = [_no_signal_hold_report(), _clean_report()]
+        calls = {"n": 0}
+
+        def _seq_cycle(*a: Any, **kw: Any) -> CycleReport:
+            r = reports[calls["n"]]
+            calls["n"] += 1
+            return r
+
+        monkeypatch.setattr(_daemon_mod._rebalance_mod, "run_cycle", _seq_cycle)
+        d, _, _, _, _ = _make_daemon(tmp_path)
+
+        d.run_once(self._T0, self._T0.isoformat())
+        t1 = self._T0 + datetime.timedelta(seconds=181)
+        result = d.run_once(t1, t1.isoformat())
+
+        assert result is not None
+        assert result.committed is True
+        assert calls["n"] == 2
+        # Good cycle CLOSED the window and the day stays consumed.
+        assert d.state.recheck_as_of is None
+        assert d.state.recheck_window_start is None
+        assert d.state.recheck_last_attempt is None
+        assert d.state.recheck_attempt_count == 0
+        assert d.state.last_scheduled_as_of == self._AS_OF
+
+    def test_derisk_does_not_restore(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # De-risk (committed=True, exec_report None, signal_ok False): that day
+        # ACTED — the day stays consumed and NO re-check window opens.
+        monkeypatch.setattr(
+            _daemon_mod._rebalance_mod, "run_cycle", lambda *a, **kw: _derisk_report()
+        )
+        d, _, _, _, _ = _make_daemon(tmp_path)
+
+        d.run_once(self._T0, self._T0.isoformat())
+
+        assert d.state.last_scheduled_as_of == self._AS_OF  # consumed
+        assert d.state.recheck_as_of is None
+        assert d.state.recheck_window_start is None
+        assert d.state.recheck_attempt_count == 0
+
+    def test_disabled_legacy_behavior(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        # signal_recheck.enabled=False → a hold consumes the day (legacy).
+        monkeypatch.setattr(_FakeCfg.signal_recheck, "enabled", False)
+        calls = self._install_counting_hold(monkeypatch)
+        d, _, _, _, _ = _make_daemon(tmp_path)
+
+        d.run_once(self._T0, self._T0.isoformat())
+
+        assert calls["n"] == 1
+        assert d.state.last_scheduled_as_of == self._AS_OF  # consumed (no restore)
+        assert d.state.recheck_as_of is None  # no window opened
+
+    def test_mf9_deferred_not_treated_as_hold(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(
+            _daemon_mod._rebalance_mod,
+            "run_cycle",
+            lambda *a, **kw: _make_deferred_cycle_report(),
+        )
+        # Part 1 — fresh daemon: a deferred report takes ONLY the MF-9 restore;
+        # NO re-check window opens (a defer says nothing about the signal).
+        d, _, _, _, _ = _make_daemon(tmp_path)
+        d.run_once(self._T0, self._T0.isoformat())
+        assert d.state.last_scheduled_as_of is None  # MF-9 restore intact
+        assert d.state.recheck_as_of is None  # no recheck window opened
+
+        # Part 2 — an OPEN window from a prior hold stays UNTOUCHED when a
+        # re-check attempt comes back deferred.
+        state = State()
+        state.last_scheduled_as_of = None  # restored by the prior hold
+        state.recheck_as_of = self._AS_OF
+        state.recheck_window_start = self._T0.isoformat()
+        state.recheck_last_attempt = self._T0.isoformat()
+        state.recheck_attempt_count = 2
+        d2, _, _, _, _ = _make_daemon(tmp_path, state=state)
+
+        t1 = self._T0 + datetime.timedelta(seconds=181)
+        result = d2.run_once(t1, t1.isoformat())
+
+        assert result is not None
+        assert result.deferred is True
+        # Window untouched — neither advanced nor closed.
+        assert d2.state.recheck_as_of == self._AS_OF
+        assert d2.state.recheck_window_start == self._T0.isoformat()
+        assert d2.state.recheck_last_attempt == self._T0.isoformat()
+        assert d2.state.recheck_attempt_count == 2
+        # MF-9 restore happened as before.
+        assert d2.state.last_scheduled_as_of is None
+
+    def test_boot_warns_on_suspect_dropped_day(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        calls = {"n": 0}
+
+        def _cycle(*a: Any, **kw: Any) -> CycleReport:
+            calls["n"] += 1
+            return _clean_report()
+
+        monkeypatch.setattr(_daemon_mod._rebalance_mod, "run_cycle", _cycle)
+        # The crash marker: day consumed, no recorded rebalance for it, no open
+        # retry/recheck windows, and the window was NOT deliberately exhausted.
+        state = State()
+        state.last_scheduled_as_of = self._AS_OF  # == expected_as_of at _T0
+        state.last_rebalanced_as_of = "2026-05-31"  # lags the scheduled day
+        d, _, sink, _, _ = _make_daemon(tmp_path, state=state)
+
+        r1 = d.run_once(self._T0, self._T0.isoformat())
+        t1 = self._T0 + datetime.timedelta(seconds=60)
+        r2 = d.run_once(t1, t1.isoformat())
+
+        # NO re-fire — detection only (fail-safe wins over availability).
+        assert r1 is None
+        assert r2 is None
+        assert calls["n"] == 0
+        assert d.state.last_scheduled_as_of == self._AS_OF  # state unchanged
+        warns = [
+            a
+            for a in sink.received
+            if a.type == AlertType.DAEMON_RESTART and a.severity == Severity.WARNING
+        ]
+        assert len(warns) == 1  # exactly ONCE across two ticks
+        assert warns[0].context["suspect_dropped_as_of"] == self._AS_OF
+
+    def test_boot_no_warn_when_window_was_exhausted(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(
+            _daemon_mod._rebalance_mod, "run_cycle", lambda *a, **kw: _clean_report()
+        )
+        # Same marker as above, but the day was DELIBERATELY consumed by a
+        # re-check window expiry → silent.
+        state = State()
+        state.last_scheduled_as_of = self._AS_OF
+        state.last_rebalanced_as_of = "2026-05-31"
+        state.recheck_exhausted_as_of = self._AS_OF
+        d, _, sink, _, _ = _make_daemon(tmp_path, state=state)
+
+        result = d.run_once(self._T0, self._T0.isoformat())
+
+        assert result is None
+        warns = [
+            a
+            for a in sink.received
+            if a.type == AlertType.DAEMON_RESTART and a.severity == Severity.WARNING
+        ]
+        assert len(warns) == 0

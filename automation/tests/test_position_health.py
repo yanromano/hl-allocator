@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+import pytest
+
 from automation.monitoring.position_health import (
     HealthSnapshot,
     PositionHealth,
@@ -400,3 +402,82 @@ def test_gather_health_snapshot_missing_mark_defaults_zero() -> None:
     snap = gather_health_snapshot(client)
     assert snap.positions[0].mark == 0.0
     assert snap.spot_usdc == 0.0
+
+
+# ---------------------------------------------------------------------------
+# B5 — direction-blind health checks for short positions
+# ---------------------------------------------------------------------------
+
+
+def test_liq_distance_alert_for_short() -> None:
+    """A SHORT position fires MARGIN_RATIO_LOW when its liquidation price is ABOVE
+    the mark price and within the warning threshold.
+
+    For a short: liq_px > mark (liquidation triggers on an adverse UP move).
+    The formula ``|mark − liq| / mark * 100`` is symmetric — the absolute value
+    makes it direction-blind.  This test pins that the check fires correctly for
+    the short geometry (liq_px > mark) so any accidental removal of ``abs()``
+    would be caught immediately.
+
+    Spec §5 (plan task B5): ``position_health.check_margin``'s symmetric formula
+    is correct for shorts; add the test.
+
+    Setup: mark=100, liq_px=105 (5% above mark, within 10% warn threshold).
+    """
+    snap = _snap(positions=[_pos("ETH", mark=100.0, liquidation_px=105.0)])
+    out = check_margin(snap, maint_frac_warn=0.5, liq_distance_pct_warn=10.0)
+
+    assert len(out) == 1, (
+        "short position with liq_px within warn distance must produce exactly one finding"
+    )
+    f = out[0]
+    assert f.alert_type is AlertType.MARGIN_RATIO_LOW
+    assert f.severity is Severity.WARNING  # 5% < 10%, but 5% >= 10%/2=5% → WARNING (not CRITICAL)
+    assert f.context["coin"] == "ETH"
+    assert f.context["mark"] == 100.0
+    assert f.context["liquidation_px"] == 105.0
+    # Symmetric distance: |100 − 105| / 100 * 100 = 5.0%
+    assert f.context["distance_pct"] == pytest.approx(5.0)
+
+
+def test_liq_distance_short_critical_threshold() -> None:
+    """Short position with liq_px 3% above mark (< 5% = 10%/2) → CRITICAL severity.
+
+    Mirrors the existing long-side CRITICAL test but with the short geometry
+    (liq above mark).  Pins the severity escalation path for shorts.
+    """
+    snap = _snap(positions=[_pos("BTC", mark=100.0, liquidation_px=103.0)])
+    out = check_margin(snap, maint_frac_warn=0.5, liq_distance_pct_warn=10.0)
+
+    assert len(out) == 1
+    assert out[0].severity is Severity.CRITICAL
+    assert out[0].context["distance_pct"] == pytest.approx(3.0)
+
+
+def test_funding_drag_short_earning_no_alert() -> None:
+    """A SHORT position with NEGATIVE ``funding_since_open`` (earning funding) must
+    NOT emit a FUNDING_DRAG alert, even when the magnitude is large.
+
+    Spec §5 / red-team M2 (plan task B5): ``check_funding`` sums the SIGNED
+    ``funding_since_open`` values with no ``abs()`` anywhere.  A short that is
+    earning funding has a negative value, which REDUCES the total funding sum and
+    therefore reduces (not increases) the drag percentage.  This test pins that
+    the code is correct: negative funding on a short → total drag ≤ 0 → no alert.
+
+    Setup: one long position paying $10 in funding drag, one short position
+    earning −$60 in funding (net sum = −$50, i.e. the account is NET earning).
+    With equity = $1000 and warn threshold = 5%, the net −5% must not fire.
+    """
+    snap = _snap(
+        equity=1000.0,
+        positions=[
+            _pos("BTC", funding_since_open=10.0),   # long paying drag
+            _pos("ETH", funding_since_open=-60.0),  # short earning funding
+        ],
+    )
+    # Net sum = −50, pct = −5% → strictly below 5% warn threshold → no alert.
+    out = check_funding(snap, drag_pct_warn=5.0)
+    assert out == [], (
+        "short position earning funding (negative funding_since_open) must not "
+        "trigger FUNDING_DRAG — signed sum already correct (red-team M2)"
+    )

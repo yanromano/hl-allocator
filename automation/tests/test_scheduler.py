@@ -27,6 +27,7 @@ from automation.runtime.scheduler import (
     expected_as_of,
     retry_window_expired,
     should_fire,
+    should_recheck_signal,
     should_retry,
 )
 
@@ -300,3 +301,51 @@ def test_retry_window_expired_false_within_window() -> None:
         now=_dt_iso("2026-05-18T02:00:00+00:00"),
         retry_window_start="2026-05-18T00:15:00+00:00",
         window_seconds=10800) is False
+
+
+# ---------------------------------------------------------------------------
+# should_recheck_signal
+# ---------------------------------------------------------------------------
+
+
+class TestShouldRecheckSignal:
+    NOW = datetime.datetime(2026, 6, 11, 0, 30, tzinfo=datetime.UTC)
+
+    def test_idle_when_no_window(self) -> None:
+        assert should_recheck_signal(
+            now=self.NOW, recheck_as_of=None, recheck_window_start=None,
+            recheck_last_attempt=None, interval_seconds=180, window_seconds=7200,
+        ) is False
+
+    def test_fires_after_interval(self) -> None:
+        assert should_recheck_signal(
+            now=self.NOW, recheck_as_of="2026-06-10",
+            recheck_window_start="2026-06-11T00:05:00+00:00",
+            recheck_last_attempt="2026-06-11T00:26:00+00:00",
+            interval_seconds=180, window_seconds=7200,
+        ) is True  # 240s since last attempt >= 180s
+
+    def test_holds_within_interval(self) -> None:
+        assert should_recheck_signal(
+            now=self.NOW, recheck_as_of="2026-06-10",
+            recheck_window_start="2026-06-11T00:05:00+00:00",
+            recheck_last_attempt="2026-06-11T00:28:30+00:00",
+            interval_seconds=180, window_seconds=7200,
+        ) is False  # 90s < 180s
+
+    def test_expired_window_never_fires(self) -> None:
+        assert should_recheck_signal(
+            now=self.NOW, recheck_as_of="2026-06-10",
+            recheck_window_start="2026-06-10T22:00:00+00:00",  # 9000s ago > 7200
+            recheck_last_attempt="2026-06-11T00:20:00+00:00",
+            interval_seconds=180, window_seconds=7200,
+        ) is False
+
+    def test_fires_at_exact_interval_boundary(self) -> None:
+        # now - last_attempt == interval_seconds exactly → fires (>= is inclusive)
+        assert should_recheck_signal(
+            now=self.NOW, recheck_as_of="2026-06-10",
+            recheck_window_start="2026-06-11T00:05:00+00:00",
+            recheck_last_attempt="2026-06-11T00:27:00+00:00",
+            interval_seconds=180, window_seconds=7200,
+        ) is True  # exactly 180s since last attempt

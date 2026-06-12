@@ -312,6 +312,7 @@ class RemoteSignalSource:
         local_max_per_asset: float,
         local_whitelist: set[str],
         local_caps: Any = None,  # noqa: ARG002 — reserved
+        allow_short: bool = False,
     ) -> None:
         # ---- F1b: pin strength validation -------------------------------
         # A short or non-hex pin is a security hole: an empty/short pin would
@@ -336,6 +337,13 @@ class RemoteSignalSource:
         self._max_validity_seconds = max_validity_seconds
         self._local_max_per_asset = local_max_per_asset
         self._local_whitelist = local_whitelist
+
+        # Defense-in-depth: audience/bearer separation already isolates sleeves
+        # at the network layer (each source URL + token is scoped to one strategy).
+        # This gate makes a MISCONFIGURED source fail LOUD — a long-only source that
+        # accidentally receives a v2 (short-capable) payload will never silently pass
+        # just because all weights happen to be positive today.
+        self._allow_short: bool = allow_short
 
         if http_client is None:
             import httpx
@@ -786,7 +794,12 @@ class RemoteSignalSource:
             )
 
     def _build_and_validate_ta(self, payload: dict[str, Any]) -> TargetAllocation:
-        """Build TargetAllocation and run the local safety validator (Check 8)."""
+        """Build TargetAllocation and run the local safety validator (Check 8).
+
+        The schema_version gate (below) runs BEFORE TargetAllocation construction
+        so that any unsupported or mismatched version is rejected with a clear
+        schema-specific message rather than a generic validation error.
+        """
         bounds: dict[str, Any] = payload.get("bounds", {})
         try:
             server_max_per_asset: float = float(bounds.get("max_per_asset", 1.0))
@@ -814,6 +827,41 @@ class RemoteSignalSource:
         # Server bounds can only TIGHTEN local caps, never loosen.
         effective_max_per_asset = min(self._local_max_per_asset, server_max_per_asset)
 
+        # ---- Schema version gate (spec §3) ---------------------------------
+        # Check 8a: supported versions.  ANY version outside {1, 2} is an
+        # unknown contract — reject immediately so bad payloads never reach
+        # TargetAllocation construction or the validator.
+        sv: int = int(payload.get("schema_version", 1))
+        if sv not in (1, 2):
+            _logger.warning(
+                "RemoteSignalSource: unsupported schema_version — rejecting",
+                schema_version=sv,
+            )
+            raise SignalRejected(
+                f"unsupported schema_version {sv} (supported: 1, 2)"
+            )
+
+        # Check 8b: schema_version=2 (short-capable payload) is only accepted
+        # when this source was explicitly configured with allow_short=True.
+        # A long-only sleeve must NEVER silently consume a v2 payload — even
+        # one whose weights happen to be all-positive today, because tomorrow's
+        # payload from the same route will carry shorts.  Fail loud, not lucky.
+        if sv == 2 and not self._allow_short:
+            _logger.warning(
+                "RemoteSignalSource: schema_version 2 payload on long-only source — rejecting",
+                client_id=self._client_id,
+            )
+            raise SignalRejected(
+                "schema_version 2 (short-capable) payload on a long-only source"
+                " — set allow_short to consume it"
+            )
+
+        # v1 payloads are always long-only by definition; the validator runs
+        # with allow_short=False regardless of the source flag.
+        # v2 payloads are short-capable ONLY when the source was configured for it
+        # (the gate above ensures we only reach here when sv==2 → allow_short==True).
+        validator_allow_short: bool = sv == 2 and self._allow_short
+
         try:
             ta = TargetAllocation(
                 as_of=datetime.date.fromisoformat(payload[_STATE_KEY_AS_OF]),
@@ -821,7 +869,7 @@ class RemoteSignalSource:
                 cash=float(payload["cash"]),
                 strategy_id=str(payload["strategy_id"]),
                 model_rev=str(payload["model_rev"]),
-                schema_version=int(payload.get("schema_version", 1)),
+                schema_version=sv,
                 audience=str(payload["audience"]),
             )
         except Exception as exc:
@@ -839,6 +887,7 @@ class RemoteSignalSource:
                 max_per_asset=effective_max_per_asset,
                 whitelist=self._local_whitelist,
                 client_id=self._client_id,
+                allow_short=validator_allow_short,
             )
         except AllocationRejected as exc:
             _logger.warning(

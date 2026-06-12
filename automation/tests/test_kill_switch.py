@@ -457,3 +457,57 @@ class TestRevokeRunbook:
         assert "revok" in result_lower
         assert "agent" in result_lower
         assert "nonce" in result_lower
+
+
+# ---------------------------------------------------------------------------
+# B5 — direction-blind flatten: short position
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenAllShort:
+    """Pin that flatten_all is direction-blind: a held short (szi = −5) is closed
+    via market_close identically to a long.
+
+    Spec §5 (plan task B5): ``flatten_all``'s reduce-only ``market_close`` already
+    closes shorts (buys) identically to longs — kill_switch.py iterates
+    ``client.positions()`` and calls ``market_close(coin, ...)`` for every
+    non-zero entry regardless of sign.  This test pins that behavior so any
+    future accidental sign-guard would be caught immediately.
+    """
+
+    def test_flatten_all_closes_short_reduce_only(self, tmp_path: Path) -> None:
+        """FakeHLClient holding szi=−5 (short) → flatten_all calls market_close for
+        that coin and the fake's position map shows the coin gone afterwards.
+
+        The reduce-only BUY direction is the client's responsibility (market_close
+        on the real HLClient issues a reduce-only market order); the daemon side
+        only cares that market_close was called and the position is cleared.
+        """
+        client = _FakeClient(positions={"ETH": Decimal("-5")})
+        ledger = _make_ledger(tmp_path)
+        sink = _CapturingAlertSink()
+
+        results = flatten_all(
+            client,
+            _FakeCfg,
+            ledger,
+            strategy_id="test",
+            now_ts="2026-06-10T00:00:00",
+            alert_sink=sink,
+        )
+
+        # market_close must have been called for the short coin.
+        coins_called = {c for c, _, _ in client.market_close_calls}
+        assert "ETH" in coins_called, (
+            "flatten_all must call market_close for a short position (szi < 0)"
+        )
+
+        # The fake reports the position as closed after the call.
+        assert client.positions().get("ETH", Decimal("0")) == Decimal("0"), (
+            "position must be cleared after market_close"
+        )
+
+        # Exactly one result entry for ETH, status 'filled'.
+        assert len(results) == 1
+        assert results[0]["coin"] == "ETH"
+        assert results[0]["status"] == "filled"

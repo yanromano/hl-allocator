@@ -166,11 +166,14 @@ def build_daemon(
     * ``client`` — when ``None``, the agent key is loaded from the configured V3
       keystore and a real ``HLClient.for_trading`` is constructed.  Inject a fake
       to skip both the keystore and the network handshake.
-    * ``source`` — the :class:`AllocationSource`.  When ``None`` it is built
-      GENERICALLY from ``cfg.signal_source.type`` via
-      ``automation.allocation.source_factory.build_source`` (NO closed-strategy
-      import).  The operator's closed-strategy path injects its allocation source
-      here from the sibling closed composition root.
+    * ``source`` — a single :class:`AllocationSource`.  When provided (the closed
+      HAARP root's injection), it becomes the lone ``"default"`` sleeve.  When
+      ``None`` the per-sleeve sources are built GENERICALLY from ``cfg.sleeves()``
+      via ``automation.allocation.source_factory.build_sources`` (NO closed-
+      strategy import) — the singular ``signal_source`` config surfaces as one
+      ``"default"`` sleeve, so the deployed long-only path is unchanged.  The
+      daemon receives the full ``sources`` dict (iterated as ``cfg.sleeves()``)
+      plus a representative ``source`` for ``dry_run`` / the legacy accessor.
     * ``now_fn`` — clock forwarded to the generic source factory (e.g. the remote
       source's freshness gate).
 
@@ -217,14 +220,23 @@ def build_daemon(
         # Drop the local reference promptly (for_trading has handed it to the SDK).
         del key
 
-    # --- Step 2: allocation source (generic, strategy-free; injectable) -------
-    # When no source is injected, build it from config by dispatching on
-    # ``cfg.signal_source.type`` — NO closed-strategy import.  The operator's
-    # closed-strategy path injects its source from the sibling closed root.
-    if source is None:
-        from automation.allocation.source_factory import build_source  # noqa: PLC0415
+    # --- Step 2: allocation sources (generic, strategy-free; injectable) ------
+    # CRASH Phase 1: build ONE source per sleeve via ``build_sources`` (the
+    # singular config surfaces as the lone ``"default"`` sleeve), dispatched on
+    # each sleeve's ``type`` — NO closed-strategy import.  The operator's closed
+    # HAARP composition root injects its single source via ``source=`` (long-only,
+    # the deployed path); that injected source becomes the ``"default"`` sleeve.
+    if source is not None:
+        # Injected single source → the lone "default" sleeve (HAARP closed root).
+        sources: dict[str, Any] = {"default": source}
+    else:
+        from automation.allocation.source_factory import build_sources  # noqa: PLC0415
 
-        source = build_source(cfg, now_fn=now_fn)
+        sources = build_sources(cfg, now_fn=now_fn)
+        # Retain a representative single source on the daemon for dry_run + the
+        # legacy ``daemon.source`` accessor: the "default" sleeve if present, else
+        # the first sleeve in config order.
+        source = sources.get("default") or next(iter(sources.values()))
 
     # --- Step 3: ledger / state / audit / alert sink at the cfg paths ---------
     ledger = IntentLedger(cfg.ledger_path)
@@ -248,6 +260,10 @@ def build_daemon(
         # per-cycle).  Without this the resolver defaults to lambda _: False and
         # orphan PENDINGs accumulate (ledger drift).  See make_chain_resolver.
         is_filled=make_chain_resolver(client),
+        # The full per-sleeve dict run_cycle iterates (cfg.sleeves()).  For the
+        # singular / injected-source path this is {"default": source} — identical
+        # behaviour to the legacy single-source cycle.
+        sources=sources,
     )
 
 

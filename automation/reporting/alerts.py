@@ -30,6 +30,7 @@ class AlertType(StrEnum):
 
     STALE_SIGNAL = "STALE_SIGNAL"
     INVALID_SIGNAL = "INVALID_SIGNAL"
+    SIGNAL_RECHECK_EXHAUSTED = "SIGNAL_RECHECK_EXHAUSTED"
     EXEC_ERROR = "EXEC_ERROR"
     DIVERGENCE = "DIVERGENCE"
     THROTTLE = "THROTTLE"
@@ -45,6 +46,17 @@ class AlertType(StrEnum):
     MARGIN_RATIO_LOW = "MARGIN_RATIO_LOW"
     COIN_VENUE_DEGRADED = "COIN_VENUE_DEGRADED"
     COLLATERAL_IN_SPOT = "COLLATERAL_IN_SPOT"
+    # CRASH Phase 1 multi-sleeve (spec §4.3, red-team L1).
+    SLEEVE_HOLD = "SLEEVE_HOLD"
+    """A sleeve failed to fetch/validate within its staleness window — its coins
+    are FROZEN (live positions carried untouched, no orders this cycle).  WARNING."""
+    SLEEVE_DERISKED = "SLEEVE_DERISKED"
+    """A sleeve exceeded its staleness window (or a short sleeve hit its second
+    consecutive HOLD) — its coins unwind to cash via the combined delta.  CRITICAL."""
+    POSITION_LIQUIDATED = "POSITION_LIQUIDATED"
+    """A position present in the baseline vanished from the live snapshot with no
+    committed exit order of ours — an apparent liquidation.  Triggers a
+    same-direction re-entry cooldown (spec §5/M3, consumed by Task C6).  CRITICAL."""
 
 
 class Severity(StrEnum):

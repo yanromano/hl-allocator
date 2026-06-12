@@ -42,11 +42,16 @@ class TargetAllocation(pydantic.BaseModel):
     as_of:
         The date for which this allocation is valid (UTC calendar date).
     weights:
-        Coin → weight mapping.  All values must be in [0, 1]; long-only.
+        Coin → weight mapping.  All values must be in [-1, 1]; negative values
+        are short fractions OF THE SLEEVE (wire protocol v2, spec §3).  The
+        long-only rule is NOT enforced at the model level — the validator layer
+        (``validate_target_allocation``) owns the long-only rule per sleeve, so
+        one model serves both v1 (long-only) and v2 (shorts-capable) payloads.
         An empty dict is valid (all-cash).
     cash:
         Uninvested fraction in [0, 1].  Must satisfy
-        ``abs(sum(weights.values()) + cash - 1.0) <= tol``.
+        ``abs(sum(weights.values()) + cash - 1.0) <= tol`` (long-only) or
+        ``abs(sum(|weights|) + cash - 1.0) <= tol`` (allow_short, spec §3).
     strategy_id:
         Opaque identifier for the producing strategy (e.g. ``"haarp-v3"``).
     model_rev:
@@ -127,6 +132,7 @@ def validate_target_allocation(
     whitelist: set[str],
     client_id: str,
     tol: float = 1e-6,
+    allow_short: bool = False,
 ) -> None:
     """Local safety gate: validates a ``TargetAllocation`` before any trade is placed.
 
@@ -148,11 +154,17 @@ def validate_target_allocation(
         (anti-replay / audience mismatch guard).
     tol:
         Floating-point tolerance for the unity-sum check.  Defaults to 1e-6.
+    allow_short:
+        If ``False`` (default), the long-only v1 contract applies — behavior is
+        byte-identical to the deployed validator, including rejection message
+        texts.  If ``True``, the v2 (shorts-capable) contract applies (spec §3):
+        weights in [-1, 1], gross on ``sum(|w|)``, unity on ``sum(|w|) + cash``,
+        per-asset cap on ``|w|``.
 
     Raises
     ------
     AllocationRejected
-        On any of the following violations:
+        On any of the following violations (``allow_short=False``):
         - any weight is NaN or infinite
         - any weight is negative (long-only contract)
         - ``sum(weights) > 1.0 + tol`` (over-allocated / implicit leverage)
@@ -160,6 +172,13 @@ def validate_target_allocation(
         - any weight exceeds ``max_per_asset`` (hard safety rail, spec S-11)
         - any coin is not in ``whitelist``
         - ``ta.audience != client_id`` (anti-replay guard)
+
+        With ``allow_short=True`` the sign-sensitive checks become (spec §3):
+        - any ``|weight| > 1.0`` (range check replaces the negative rejection)
+        - ``sum(|weights|) > 1.0 + tol`` (gross exposure / implicit leverage)
+        - ``abs(sum(|weights|) + cash - 1.0) > tol`` (unity on magnitudes)
+        - any ``|weight|`` exceeds ``max_per_asset``
+        Finiteness / whitelist / audience checks are unchanged.
     """
     # ---- 1. Audience check (anti-replay, do first — cheapest) -------------
     if ta.audience != client_id:
@@ -201,6 +220,92 @@ def validate_target_allocation(
             strategy_id=ta.strategy_id,
         )
         raise AllocationRejected(f"Non-finite cash value: {ta.cash}")
+
+    if allow_short:
+        # ------------------------------------------------------------------
+        # v2 (allow_short) semantics — wire protocol v2, spec §3.
+        #
+        # A negative weight is a short fraction OF THE SLEEVE.  ``cash`` is the
+        # UNENCUMBERED sleeve fraction: under 1x-isolated margin accounting a
+        # short consumes margin equal to its notional, exactly like a long, so
+        # the budget identity is ``sum(|w|) + cash == 1`` and gross exposure is
+        # ``sum(|w|) <= 1`` (no implicit leverage).  The per-asset cap likewise
+        # applies to magnitude ``|w|``.  The long-only branch below is kept
+        # byte-identical for deployed-client parity — do NOT merge the paths.
+        # ------------------------------------------------------------------
+
+        # ---- 3'. Range: every weight in [-1, 1] ----------------------------
+        out_of_range = {coin: w for coin, w in ta.weights.items() if abs(w) > 1.0}
+        if out_of_range:
+            _logger.warning(
+                "validate_target_allocation: weights outside [-1, 1] (allow_short)",
+                coins={coin: round(w, 6) for coin, w in out_of_range.items()},
+                strategy_id=ta.strategy_id,
+            )
+            raise AllocationRejected(
+                f"Weights outside [-1, 1] (allow_short): "
+                f"{[(c, round(w, 6)) for c, w in out_of_range.items()]}"
+            )
+
+        # ---- 4'. Whitelist check (same rule as long-only) ------------------
+        unknown = {coin for coin in ta.weights if coin not in whitelist}
+        if unknown:
+            _logger.warning(
+                "validate_target_allocation: coins outside whitelist",
+                unknown_coins=sorted(unknown),
+                strategy_id=ta.strategy_id,
+            )
+            raise AllocationRejected(
+                f"Coins not in whitelist: {sorted(unknown)}"
+            )
+
+        # ---- 5'. Per-asset cap on |w| (SAFETY RAIL — abort, never clamp) ----
+        breaching = {
+            coin: w for coin, w in ta.weights.items() if abs(w) > max_per_asset
+        }
+        if breaching:
+            _logger.warning(
+                "validate_target_allocation: per-asset cap breached on |w| — "
+                "ABORTING (spec S-11)",
+                breaching_coins={coin: round(w, 6) for coin, w in breaching.items()},
+                max_per_asset=max_per_asset,
+                strategy_id=ta.strategy_id,
+            )
+            raise AllocationRejected(
+                f"Per-asset cap ({max_per_asset}) breached on |w| for: "
+                f"{[(c, round(w, 6)) for c, w in breaching.items()]}. "
+                "Signal is untrusted — executor hard-alerts (spec S-11)."
+            )
+
+        # ---- 6'. Gross exposure: sum(|w|) <= 1 + tol ------------------------
+        gross = sum(abs(w) for w in ta.weights.values())
+        if gross > 1.0 + tol:
+            _logger.warning(
+                "validate_target_allocation: gross exposure sum(|weights|) "
+                "exceeds 1.0",
+                gross=round(gross, 9),
+                strategy_id=ta.strategy_id,
+            )
+            raise AllocationRejected(
+                f"gross exposure sum(|weights|) = {gross:.9f} exceeds "
+                f"1.0 + tol ({1.0 + tol:.9f})"
+            )
+
+        # ---- 7'. Unity sum on magnitudes: sum(|w|) + cash == 1 ± tol --------
+        total = gross + ta.cash
+        if abs(total - 1.0) > tol:
+            _logger.warning(
+                "validate_target_allocation: sum(|weights|) + cash does not "
+                "equal 1.0",
+                total=round(total, 9),
+                gross=round(gross, 9),
+                cash=round(ta.cash, 9),
+                strategy_id=ta.strategy_id,
+            )
+            raise AllocationRejected(
+                f"sum(|weights|) + cash = {total:.9f}, expected 1.0 ± {tol}"
+            )
+        return
 
     # ---- 3. Long-only: no negative weights ---------------------------------
     negative = {coin: w for coin, w in ta.weights.items() if w < 0.0}

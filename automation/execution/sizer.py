@@ -26,6 +26,7 @@ MIN_NOTIONAL_USD : Decimal
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal, TypedDict
@@ -82,13 +83,23 @@ class OrderPlan:
     coin:
         Perp name (after universe_perp_map translation).
     target_size:
-        Target absolute position size (floored, ≥ 0 for long-only).
+        Target position size, floored toward zero.  SIGNED when the plan was
+        built with ``allow_short=True`` — negative = short.  ≥ 0 in long-only
+        plans (the default).
     delta_size:
         Signed size change: ``target_size - current_position``.
     delta_notional:
         USD notional of the delta: ``delta_size * mark_price``.
     side:
         ``"buy"`` if delta_size > 0, ``"sell"`` otherwise.
+    is_close_leg:
+        ``True`` only for the CLOSE leg of a zero-crossing flip (red-team H4).
+        A flipping coin emits TWO OrderPlans: a close-leg
+        (``target_size=0.0``, ``delta=-pos``, ``is_close_leg=True``) followed
+        by an open-leg (the final signed target).  The executor routes a close
+        leg through the reduce-only full-exit path and the cap pre-flight
+        counts the coin's end-state notional ONCE (the open-leg's).  Default
+        ``False`` keeps every existing construction valid.
     """
 
     coin: str
@@ -96,6 +107,7 @@ class OrderPlan:
     delta_size: float
     delta_notional: float
     side: Literal["buy", "sell"]
+    is_close_leg: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,14 +123,17 @@ class SizePlan:
         Human-readable reason string (e.g. ``"bootstrap"``, ``"hold"``,
         ``"max_delta=0.0400>=0.0300"``).
     orders:
-        Planned OrderPlan objects, sorted by abs(delta_notional) DESCENDING.
-        Only populated when rebalance=True.
+        Planned OrderPlan objects, sorted by abs(delta_notional) DESCENDING
+        (per coin: by the coin's largest leg, the close-leg of a flip always
+        directly before its open-leg).  Only populated when rebalance=True.
     skipped:
         List of dicts with keys ``{"coin", "reason", "delta_notional"}`` for
         coins excluded from orders (e.g. below_min_notional, unpriceable).
     flatten:
         Perp names with current szi < 0 (short positions) that must be closed
-        before the new longs are entered (long-only guard).
+        before the new longs are entered (long-only guard).  Populated only
+        when ``allow_short=False`` — a sleeve that allows shorts OWNS its
+        short positions and manages them through delta orders instead.
     target_sizes:
         Final target sizes by perp name (post-flooring, post-scale-down).
     achieved_weights:
@@ -129,7 +144,9 @@ class SizePlan:
     scale_factor:
         The scale factor applied (1.0 if no scale-down occurred).
     gross_notional:
-        Sum of ``target_size × mark`` across all planned coins (post-scale).
+        Sum of ``|target_size × mark|`` across all planned coins (post-scale).
+        Magnitude-based: shorts ADD to gross exposure, they never cancel
+        longs (red-team C1).
     equity:
         Equity value used for sizing (float for convenience in reports).
     """
@@ -152,11 +169,33 @@ def _map_perp(ticker: str, universe_perp_map: dict[str, str]) -> str:
     return universe_perp_map.get(ticker, ticker)
 
 
+def _floor_size_signed(raw_size: float, sz_decimals: int) -> float:
+    """Floor a SIGNED size TOWARD zero — magnitude shrinks, direction is kept.
+
+    C2 (red-team CRITICAL): ``floor_size`` uses ``math.floor``, which on a
+    NEGATIVE size rounds AWAY from zero (``floor(-1.0001) = -2.0``) — flooring
+    a short target would GROW its exposure, the exact opposite of rounding.py's
+    "flooring can only shrink Σ(size × price)" guarantee.  Floor the magnitude,
+    then reapply the sign (``copysign``).  For longs this is bit-identical to
+    the plain ``floor_size`` call it replaces.
+
+    ``floor_size`` is referenced via the module global (not re-imported) so the
+    guard tests can monkeypatch it.
+    """
+    if raw_size == 0.0:
+        return 0.0
+    return math.copysign(floor_size(abs(raw_size), sz_decimals), raw_size)
+
+
 def plan(
     target: TargetAllocation,
     snap: Snapshot,
     state: State,
     cfg: Config,
+    *,
+    allow_short: bool = False,
+    frozen_coins: frozenset[str] = frozenset(),
+    cooldown_blocked: frozenset[str] = frozenset(),
 ) -> SizePlan:
     """Compute the full size plan for one rebalance cycle.
 
@@ -174,6 +213,39 @@ def plan(
         Current persistent executor state (read-only here).
     cfg:
         Executor configuration.
+    allow_short:
+        When True, negative target weights are planned as SHORT positions —
+        target sizes stay SIGNED end-to-end (sell-to-open, buy-to-close fall
+        out of the sign-aware delta math) and the long-only flatten guard is
+        disabled.  Default False preserves the long-only contract: every held
+        short is flagged in ``SizePlan.flatten``.
+    frozen_coins:
+        Coins belonging to HELD sleeves (CRASH Phase 1, spec §4.3, red-team H3 /
+        C5 sizer note).  A frozen coin's live position is CARRIED UNTOUCHED this
+        cycle: it produces NO OrderPlan and is EXCLUDED from the ratchet
+        threshold / abs-drift comparison (its stale position must never trip — or
+        damp — a rebalance for the TRADED book).  But its live ``|notional|``
+        STILL consumes margin, so it IS counted into the gross-cap math (the
+        scale-down cap and the post-sizing hard guard) — otherwise a frozen
+        sleeve's exposure would be invisible to the Σ|notional| ≤ E·(1−buffer)
+        invariant and the account could be silently over-leveraged.  Default
+        ``frozenset()`` preserves every existing (singular / long-only) cycle
+        byte-for-byte: no coin is frozen, so every branch below is a no-op.
+    cooldown_blocked:
+        Coins under a post-liquidation re-entry cooldown whose NEW target is in the
+        SAME direction as the position that was liquidated (CRASH Phase 1, spec
+        §5 / red-team M3).  ``run_cycle`` owns the direction reasoning — a coin only
+        lands here when its new combined-target sign MATCHES the liquidated
+        direction; an OPPOSITE-direction re-entry (the squeeze flipped the thesis)
+        is intentionally ABSENT so it trades normally.  A blocked coin produces NO
+        OrderPlan and is recorded in ``SizePlan.skipped`` with reason ``"cooldown"``
+        so the operator sees the deliberate non-entry.  Unlike ``frozen_coins`` a
+        cooldown coin was LIQUIDATED → flat, so there is NO live position: no
+        gross-cap contribution and no exit to suppress — it is simply dropped from
+        the sizing set before any size is computed.  Coins are addressed in TICKER
+        space (the baseline / target key space); the perp mapping below translates
+        them so the drop lines up with ``target_w_by_perp``.  Default
+        ``frozenset()`` is a no-op for every existing cycle.
 
     Returns
     -------
@@ -183,9 +255,37 @@ def plan(
     # -----------------------------------------------------------------------
     # Step 1: Map strategy tickers to perp names
     # -----------------------------------------------------------------------
+    # COOLDOWN DROP (red-team M3): a coin under a same-direction post-liquidation
+    # cooldown is removed from the target BEFORE sizing so it can produce no order
+    # and never enters the gross/threshold math.  It is recorded as a deliberate
+    # skip (reason "cooldown") for operator visibility.  Drop in TICKER space (the
+    # target's key space) so the entry is excluded regardless of ticker→perp
+    # aliasing; the live book is flat for these coins (they were liquidated), so
+    # there is nothing else to carry.
+    cooldown_skipped: list[SkipEntry] = []
+    effective_weights: dict[str, float] = dict(target.weights)
+    for ticker in cooldown_blocked:
+        if ticker in effective_weights:
+            cooldown_skipped.append({
+                "coin": _map_perp(ticker, cfg.universe_perp_map),
+                "reason": "cooldown",
+                "delta_notional": 0.0,
+            })
+            del effective_weights[ticker]
+
     target_w_by_perp: dict[str, float] = {
         _map_perp(ticker, cfg.universe_perp_map): w
-        for ticker, w in target.weights.items()
+        for ticker, w in effective_weights.items()
+    }
+
+    # Frozen coins are addressed in PERP space (the combination layer keys them by
+    # the same symbol the snapshot uses).  Map through universe_perp_map so the
+    # exclusion below lines up with snap.positions / target_w_by_perp regardless of
+    # ticker→perp aliasing.  Frozen coins are guaranteed disjoint from the traded
+    # target (the combination layer raises on a frozen-coin conflict), so this set
+    # never intersects target_w_by_perp.
+    frozen_perps: set[str] = {
+        _map_perp(c, cfg.universe_perp_map) for c in frozen_coins
     }
 
     # -----------------------------------------------------------------------
@@ -207,13 +307,31 @@ def plan(
     else:
         prev = state.last_rebalanced_target
         # Compare in TICKER space (both target.weights and prev are in ticker space).
-        all_tickers = set(target.weights.keys()) | set(prev.keys())
+        # EXCLUDE frozen coins (red-team H3): a held sleeve's coins are carried
+        # untouched this cycle, so their stale baseline entry must NOT count toward
+        # the threshold — otherwise a frozen short sitting in ``prev`` (the combined
+        # baseline records signed weights) but absent from the new traded target
+        # would register a spurious ``max_delta`` and force a rebalance of the
+        # TRADED book on the dark sleeve's behalf.  Frozen coins are disjoint from
+        # the new target, so excluding them only drops stale-baseline noise.
+        # Compare against ``effective_weights`` (the cooldown-dropped target): a
+        # coin under a same-direction cooldown is removed from the traded set, so
+        # its baseline-vs-target delta must NOT count toward the threshold —
+        # otherwise the liquidated short still sitting in ``prev`` (e.g. −0.3) vs the
+        # dropped re-entry would register a large ``max_delta`` and force a rebalance
+        # of the rest of the book on behalf of a coin we are deliberately NOT
+        # re-entering.  Exclude both frozen and cooldown-blocked tickers.
+        all_tickers = (
+            (set(effective_weights.keys()) | set(prev.keys()))
+            - frozen_coins
+            - cooldown_blocked
+        )
         # ``default=0.0`` guards the all-cash → all-cash transition: when both the
         # previous frozen target and the new target are empty (100% cash, e.g. HAARP
         # fully risk-off for >1 day), ``all_tickers`` is empty and a bare ``max()``
         # would raise ValueError and crash the daemon.  No tickers ⇒ no change ⇒ HOLD.
         max_delta = max(
-            (abs(target.weights.get(t, 0.0) - prev.get(t, 0.0)) for t in all_tickers),
+            (abs(effective_weights.get(t, 0.0) - prev.get(t, 0.0)) for t in all_tickers),
             default=0.0,
         )
 
@@ -232,11 +350,24 @@ def plan(
         # input is snap.positions, which is perp-keyed).  If a future change keyed
         # achieved by ticker, target_w(p) − achieved(p) would equal target_w for
         # every perp, spuriously forcing a full rebalance every cycle.
+        # EXCLUDE frozen perps from the drift union too (red-team H3): a frozen
+        # sleeve's live position appears in ``achieved`` but its target is
+        # intentionally absent — without the exclusion ``target_w(p) − achieved(p)``
+        # would equal the full live weight and trip the abs-drift backstop, forcing
+        # the traded book to rebalance because a DARK sleeve is holding inventory.
+        # EXCLUDE cooldown perps too (red-team M3): a liquidated coin's OLD baseline
+        # weight lives in ``prev_by_perp`` (e.g. −0.3) while the book is now flat
+        # (``achieved`` has no entry) — ``target_w(p) − achieved(p)`` would equal the
+        # full stale weight and trip the backstop, forcing a rebalance just to honor
+        # a coin we are deliberately holding OUT during the cooldown.
+        cooldown_perps: set[str] = {
+            _map_perp(c, cfg.universe_perp_map) for c in cooldown_blocked
+        }
         all_perps = (
             set(target_w_by_perp.keys())
             | set(prev_by_perp.keys())
             | set(achieved.keys())
-        )
+        ) - frozen_perps - cooldown_perps
         abs_drift = max(
             abs(target_w_by_perp.get(p, 0.0) - achieved.get(p, 0.0))
             for p in all_perps
@@ -266,11 +397,14 @@ def plan(
     # Early return: HOLD (all-or-nothing)
     # -----------------------------------------------------------------------
     if not rebalance:
+        # Surface any cooldown drops even on a HOLD: a same-direction re-entry that
+        # the cooldown suppressed must remain visible to the operator (it is the
+        # WHOLE reason a coin the strategy wanted produced no order this cycle).
         return SizePlan(
             rebalance=False,
             reason=reason,
             orders=[],
-            skipped=[],
+            skipped=cooldown_skipped,
             flatten=[],
             target_sizes={},
             achieved_weights=achieved,
@@ -307,36 +441,91 @@ def plan(
         px = float(mark_dec)
         perp_prices[perp] = px
         szd = snap.sz_decimals.get(perp, 0)
+        # target_notional and raw_size are SIGNED (negative = short target).
+        # The sign is the position's direction and must survive into the order;
+        # every CAP computation below works on the magnitude instead (C1).
         target_notional = w * E
         intended_notional[perp] = target_notional
         raw_size = target_notional / px
-        floored_size = floor_size(raw_size, szd)
+        floored_size = _floor_size_signed(raw_size, szd)
         raw_target_sizes[perp] = floored_size
 
     # -----------------------------------------------------------------------
     # Step 5: Σnotional ≤ E×(1 − safety_buffer) invariant (MF-8)
     # -----------------------------------------------------------------------
     cap = E * (1.0 - cfg.safety_buffer)
-    gross = sum(raw_target_sizes[p] * perp_prices[p] for p in raw_target_sizes)
+    # FROZEN-coin live exposure (CRASH Phase 1, spec §4.3 / C5 sizer note): a held
+    # sleeve's coins are not in the traded target, but their live positions still
+    # consume margin THIS cycle.  Sum their |notional| once (live size × mark) and
+    # add it to BOTH gross accumulations below so the Σ|notional| ≤ E·(1−buffer)
+    # invariant accounts for the frozen book — otherwise a dark sleeve's exposure
+    # is invisible to the cap and the traded sleeve could be sized into an
+    # over-leveraged combined book.  A frozen coin with no mark (unpriceable) is
+    # silently 0 here — it cannot be sized anyway and the divergence/health layer
+    # surfaces an unpriceable held coin separately.
+    frozen_live_notional = 0.0
+    for fp in frozen_perps:
+        pos = float(snap.positions.get(fp, Decimal("0")))
+        mark_dec = snap.marks.get(fp)
+        if pos != 0.0 and mark_dec is not None and float(mark_dec) > 0.0:
+            frozen_live_notional += abs(pos * float(mark_dec))
+    # C1 (red-team CRITICAL): gross exposure is the sum of MAGNITUDES, never the
+    # signed sum.  Long and short notionals both consume margin — at 1x-isolated
+    # each position's margin equals its |notional| — but in a signed sum they
+    # CANCEL: an all-short book has NEGATIVE "gross" and would never trip this
+    # cap, and a +0.5/−0.5 book has signed gross ≈ 0 while true exposure is
+    # 1.0·E.  Either way the MF-8 invariant (Σ|notional| ≤ E·(1−safety_buffer))
+    # would be silently unenforced and the account over-leveraged.  Every gross
+    # accumulation in this function (here, and post_gross below) must therefore
+    # be abs()-based.
+    #
+    # TRADED gross = the scalable portion (the sleeves we are actively trading).
+    # FROZEN gross = the frozen book's live |notional|, which is UNSCALABLE this
+    # cycle (we emit no orders for frozen coins).  The combined book is
+    # traded + frozen.  When the combined book exceeds the cap, only the TRADED
+    # portion can be scaled — and it must be scaled to fit the cap MINUS the
+    # frozen notional (scaling by cap/combined would leave traded·(cap/combined) +
+    # frozen, which still exceeds the cap because frozen is fixed).  If the frozen
+    # book ALONE already meets or exceeds the cap, ``headroom`` is 0 → the traded
+    # book scales to size 0 (we add nothing to an already-over-cap book).  But the
+    # frozen exposure ITSELF still violates the invariant, so ``post_gross`` (=
+    # 0 + frozen_live_notional) > cap and the HARD guard below RAISES SizerError —
+    # this is fail-loud-safe, NOT a silent clamp: the daemon catches it as an
+    # EXEC_ERROR and halts the cycle rather than trading into an over-leveraged
+    # frozen book.  Reducing a frozen sleeve's own exposure is impossible here (we
+    # emit no orders for it); the operator / de-risk path must address it.
+    traded_gross = sum(
+        abs(raw_target_sizes[p] * perp_prices[p]) for p in raw_target_sizes
+    )
+    gross = traded_gross + frozen_live_notional
 
     scaled_down = False
     scale_factor = 1.0
     target_sizes: dict[str, float] = {}
 
-    if gross > cap and gross > 0.0:
-        scale_factor = cap / gross
+    if gross > cap and traded_gross > 0.0:
+        # Scale the TRADED book to fit the headroom left after the unscalable
+        # frozen book.  ``headroom`` can be <= 0 if the frozen book alone exceeds
+        # the cap → scale_factor clamps to 0 (drop the traded legs entirely).
+        headroom = max(cap - frozen_live_notional, 0.0)
+        scale_factor = headroom / traded_gross
         scaled_down = True
         _logger.info(
             "sizer.plan: scaling down to fit safety buffer",
             gross=round(gross, 2),
+            traded_gross=round(traded_gross, 2),
+            frozen_live_notional=round(frozen_live_notional, 2),
             cap=round(cap, 2),
             scale_factor=round(scale_factor, 6),
         )
         for perp, raw_size in raw_target_sizes.items():
             px = perp_prices[perp]
             szd = snap.sz_decimals.get(perp, 0)
+            # scale_factor ∈ [0, 1) so multiplying the SIGNED notional shrinks
+            # its magnitude while preserving direction — the cap math above is
+            # what must (and does) use abs(); the size itself stays signed.
             scaled_notional = raw_size * px * scale_factor
-            target_sizes[perp] = floor_size(scaled_notional / px, szd)
+            target_sizes[perp] = _floor_size_signed(scaled_notional / px, szd)
     else:
         target_sizes = dict(raw_target_sizes)
 
@@ -348,7 +537,12 @@ def plan(
     # emit a WARNING so the wanted coin never disappears without a trace.
     zeroed_by_cap: set[str] = set()
     for perp, want_notional in intended_notional.items():
-        if want_notional > 0.0 and target_sizes.get(perp, 0.0) == 0.0:
+        # abs() because want_notional is SIGNED (negative = short intent, B3):
+        # a bare `> 0.0` can never fire for a wanted SHORT erased by the cap —
+        # it would be silently misfiled under below_min_notional with no F1
+        # warning.  Explicit-zero targets (want_notional == 0.0, i.e. "close
+        # this coin") remain exempt: nothing was wanted, nothing was erased.
+        if abs(want_notional) > 0.0 and target_sizes.get(perp, 0.0) == 0.0:
             zeroed_by_cap.add(perp)
             _logger.warning(
                 "sizer.plan: coin zeroed by cap/scale-down — wanted but no order",
@@ -367,27 +561,49 @@ def plan(
     # guard (F5).  `assert` is stripped under ``python -O``, so we raise
     # SizerError explicitly.  A relative tolerance is used (robust at large
     # equity) instead of an absolute 1e-6.
-    post_gross = sum(target_sizes[p] * perp_prices[p] for p in target_sizes)
+    # Like `gross` above, this MUST sum magnitudes (C1): a signed sum lets a
+    # short-heavy book pass the guard with true exposure far above the cap.  The
+    # frozen book's live |notional| is folded in (it consumes margin this cycle).
+    post_gross = (
+        sum(abs(target_sizes[p] * perp_prices[p]) for p in target_sizes)
+        + frozen_live_notional
+    )
     if post_gross > cap * (1.0 + 1e-9):
         raise SizerError(
-            f"Σnotional {post_gross:.4f} exceeds cap {cap:.4f} after sizing — "
+            f"Σ|notional| {post_gross:.4f} exceeds cap {cap:.4f} after sizing — "
             "money invariant violated (flooring/scale-down should only shrink)"
         )
 
     # -----------------------------------------------------------------------
     # Step 6: Long-only guard — flag any existing short positions to flatten
     # -----------------------------------------------------------------------
-    flatten: list[str] = [
-        perp
-        for perp, szi in snap.positions.items()
-        if float(szi) < 0.0
-    ]
+    # Conditional on allow_short (B3).  For pure-long deployments this stays
+    # on as a RESIDUE SWEEPER: any short on the book is foreign (manual
+    # intervention, partial fill of an old close) and must be flattened before
+    # longs are entered.  Sleeves with shorts OWN their positions — sweeping
+    # them here would close the sleeve's own shorts every cycle, fighting the
+    # delta orders built in Step 7.
+    flatten: list[str] = []
+    if not allow_short:
+        flatten = [
+            perp
+            for perp, szi in snap.positions.items()
+            if float(szi) < 0.0 and perp not in frozen_perps
+        ]
 
     # -----------------------------------------------------------------------
     # Step 7: Build delta orders
     # -----------------------------------------------------------------------
     # Union of target perps and currently-held perps (so we can plan exits too).
-    all_perps_to_plan = set(target_sizes.keys()) | set(snap.positions.keys())
+    # EXCLUDE frozen perps (red-team H3): a held sleeve's coins are carried
+    # untouched — they must produce NO order this cycle (neither a delta toward a
+    # target they have, since they have none, NOR a close-to-zero exit, which is
+    # exactly what including a held position with no target would generate).  The
+    # frozen position simply persists; its sleeve will re-target it once its signal
+    # is fresh again.
+    all_perps_to_plan = (
+        set(target_sizes.keys()) | set(snap.positions.keys())
+    ) - frozen_perps
 
     orders: list[OrderPlan] = []
     order_skipped: list[SkipEntry] = []
@@ -414,34 +630,72 @@ def plan(
                 continue
             px = float(mark_dec)
 
-        delta_size = ts - pos
-        delta_notional = delta_size * px
+        # -------------------------------------------------------------------
+        # FLIP (zero-crossing, red-team H4): target and position both nonzero
+        # with OPPOSITE signs → NEVER cross zero in one IOC.  Emit TWO legs,
+        # close-leg first:
+        #   close-leg: target 0.0, delta = −pos (the full close) — routed by
+        #              the executor through reduce-only ``market_close``, which
+        #              structurally cannot overshoot past zero.
+        #   open-leg:  target = final signed target, delta = target − 0 — a
+        #              plain IOC anchored at flat.
+        # WHY two legs: a single crossing IOC would "work" on HL but couples
+        # the close and open margin semantics into one fill — a partial fill
+        # can strand the book anywhere between the old and new position, and
+        # the reduce-only safety property (auditable can't-over-close) is
+        # impossible for a crossing order.  Recovery is STRUCTURAL: if the
+        # close fills and the open fails/defers, the next plan() is anchored
+        # to the live (now flat) position and re-emits the open delta alone.
+        # Flips only arise with allow_short sleeves (a long-only target can't
+        # oppose a long position), but the detection is pure sign math — it
+        # guards foreign shorts under long-only configs too.
+        if ts * pos < 0.0:
+            legs: list[tuple[float, float, bool]] = [
+                (0.0, -pos, True),   # close-leg: reduce the position to flat
+                (ts, ts, False),     # open-leg: open the final signed target
+            ]
+        else:
+            legs = [(ts, ts - pos, False)]
 
-        if abs(delta_notional) < float(MIN_NOTIONAL_USD):
-            # A coin already recorded as zeroed_by_cap with no position to exit
-            # would land here with delta≈0 — don't double-record it as
-            # below_min_notional; its zeroed_by_cap entry already explains it.
-            if perp not in zeroed_by_cap:
-                order_skipped.append({
-                    "coin": perp,
-                    "reason": "below_min_notional",
-                    "delta_notional": delta_notional,
-                })
-            continue
+        for leg_target, leg_delta, is_close_leg in legs:
+            delta_notional = leg_delta * px
 
-        side: Literal["buy", "sell"] = "buy" if delta_size > 0 else "sell"
-        orders.append(OrderPlan(
-            coin=perp,
-            target_size=ts,
-            delta_size=delta_size,
-            delta_notional=delta_notional,
-            side=side,
-        ))
+            if abs(delta_notional) < float(MIN_NOTIONAL_USD):
+                # A coin already recorded as zeroed_by_cap with no position to
+                # exit would land here with delta≈0 — don't double-record it as
+                # below_min_notional; its zeroed_by_cap entry already explains it.
+                if perp not in zeroed_by_cap:
+                    order_skipped.append({
+                        "coin": perp,
+                        "reason": "below_min_notional",
+                        "delta_notional": delta_notional,
+                    })
+                continue
 
-    # Sort by abs(delta_notional) descending (largest first).
-    orders.sort(key=lambda o: abs(o.delta_notional), reverse=True)
+            side: Literal["buy", "sell"] = "buy" if leg_delta > 0 else "sell"
+            orders.append(OrderPlan(
+                coin=perp,
+                target_size=leg_target,
+                delta_size=leg_delta,
+                delta_notional=delta_notional,
+                side=side,
+                is_close_leg=is_close_leg,
+            ))
 
-    all_skipped: list[SkipEntry] = skipped + order_skipped
+    # Sort largest-first by the COIN's biggest leg notional, with the close
+    # leg of a flip ALWAYS before its open leg.  A plain abs(delta_notional)
+    # sort would put the open leg first whenever the new |target| exceeds the
+    # old |position| — the open IOC would then fire while the opposite
+    # position is still on (double-sided margin, and the close would no longer
+    # be a clean reduce-only of the original size).  Keying both legs of a
+    # coin by the pair's max notional preserves the global size ordering while
+    # the is_close_leg tie-break pins close-before-open within the coin.
+    pair_key: dict[str, float] = {}
+    for o in orders:
+        pair_key[o.coin] = max(pair_key.get(o.coin, 0.0), abs(o.delta_notional))
+    orders.sort(key=lambda o: (pair_key[o.coin], o.is_close_leg), reverse=True)
+
+    all_skipped: list[SkipEntry] = cooldown_skipped + skipped + order_skipped
 
     _logger.info(
         "sizer.plan: complete",

@@ -617,3 +617,38 @@ def test_health_http_overrides_parse() -> None:
     cfg = Config(**raw)
     assert cfg.health.http_port == 9000
     assert cfg.health.heartbeat_max_silence_seconds == 300
+
+
+# ---------------------------------------------------------------------------
+# SP3: SignalRecheckConfig block (no-signal re-fire window)
+# ---------------------------------------------------------------------------
+
+
+def test_defaults_when_block_absent(tmp_path: Path) -> None:
+    """A YAML with NO signal_recheck key must default to the SignalRecheckConfig defaults."""
+    raw: dict = yaml.safe_load(EX.read_text())
+    raw.pop("signal_recheck", None)  # ensure no block in this yaml
+    yaml_path = tmp_path / "cfg.yaml"
+    yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+    cfg = Config.from_yaml(yaml_path)
+    assert cfg.signal_recheck.enabled is True
+    assert cfg.signal_recheck.interval_seconds == 180
+    assert cfg.signal_recheck.window_seconds == 7200
+
+
+def test_block_overrides(tmp_path: Path) -> None:
+    """A signal_recheck: block in the YAML must thread through Config.from_yaml unchanged."""
+    raw: dict = yaml.safe_load(EX.read_text())
+    raw["signal_recheck"] = {
+        "enabled": False,
+        "interval_seconds": 60,
+        "window_seconds": 600,
+    }
+    yaml_path = tmp_path / "cfg.yaml"
+    yaml_path.write_text(yaml.dump(raw), encoding="utf-8")
+
+    cfg = Config.from_yaml(yaml_path)
+    assert cfg.signal_recheck.enabled is False
+    assert cfg.signal_recheck.interval_seconds == 60
+    assert cfg.signal_recheck.window_seconds == 600

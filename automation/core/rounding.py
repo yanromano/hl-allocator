@@ -77,6 +77,15 @@ def round_price(
 def floor_size(sz: Decimal | float, sz_decimals: int) -> float:
     """Floor a size to ``sz_decimals`` decimal places (never rounds up).
 
+    .. warning::
+        The "never rounds up" guarantee holds for the MAGNITUDE only when
+        ``sz >= 0``.  ``math.floor`` on a NEGATIVE size rounds AWAY from zero
+        (``floor_size(-1.0001, 0) == -2.0``), which would GROW a short
+        position's exposure (red-team C2).  Callers sizing signed positions
+        must floor on the magnitude and reapply the sign — the copysign
+        pattern: ``math.copysign(floor_size(abs(raw), szd), raw)`` (see
+        ``automation.execution.sizer._floor_size_signed``).
+
     Parameters
     ----------
     sz:

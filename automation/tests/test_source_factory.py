@@ -208,8 +208,10 @@ def test_unknown_type_raises(tmp_path: Path) -> None:
         tmp_path,
         SignalSourceConfig(type="equal_weight", client_id="c1"),
     )
-    # Bypass the pydantic Literal by mutating after construction.
-    object.__setattr__(cfg.signal_source, "type", "bogus")
+    # Bypass the pydantic Literal by mutating after construction.  build_source
+    # now dispatches on the NORMALIZED sleeve (cfg.sleeves()[0]), which is a COPY
+    # of signal_source — mutate the sleeve the factory actually consumes.
+    object.__setattr__(cfg.sleeves()[0], "type", "bogus")
     with pytest.raises(ValueError, match="signal_source.type|bogus|unknown"):
         build_source(cfg)
 

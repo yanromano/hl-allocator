@@ -98,6 +98,10 @@ def cycle_record(
         "deferred": deferred,
         "n_throttled": n_throttled,
         "coins": coins,
+        # CRASH Phase 1 (spec §4.5): per-sleeve attribution — {name: {as_of,
+        # weights, outcome}}.  Empty {} on no-good-signal / de-risk cycles (no
+        # combination ran) and on legacy singular cycles only when no sleeve served.
+        "sleeves": report.sleeves,
     }
 
 

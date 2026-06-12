@@ -21,7 +21,14 @@ from pydantic import BaseModel, model_validator
 
 
 class SignalSourceConfig(BaseModel):
-    """Where the executor fetches allocation weights from."""
+    """Where the executor fetches allocation weights from.
+
+    One ``SignalSourceConfig`` is a SLEEVE: an independent signed signal with
+    its own equity ``budget`` and short capability.  The deployed singular
+    ``signal_source:`` block is one sleeve named ``"default"`` (budget 1.0,
+    long-only); the new ``signal_sources:`` list holds N of them on one
+    account (CRASH Phase 1).
+    """
 
     type: Literal["remote", "equal_weight", "single_asset"]
     """Signal source type.
@@ -48,6 +55,26 @@ class SignalSourceConfig(BaseModel):
 
     client_id: str | None = None
     """Opaque client identifier sent in the ``X-Client-ID`` request header."""
+
+    name: str = "default"
+    """Unique sleeve name (snake_case).  Keys per-sleeve state files and audit
+    records.  The singular ``signal_source:`` block normalizes to ``"default"``;
+    every entry in a ``signal_sources:`` list MUST be uniquely named."""
+
+    budget: float = 1.0
+    """Fraction of TOTAL equity this sleeve commands (``0 < budget <= 1``).  The
+    sleeves' budgets must sum to ``<= 1``; the remainder is a permanent cash
+    buffer.  The singular path is always 1.0 (the whole account)."""
+
+    allow_short: bool = False
+    """When True, this sleeve may serve signed (negative) weights — a v2 /
+    short-capable sleeve.  Requires ``type=="remote"`` (there is no short
+    ``equal_weight``).  The singular path is always long-only (False)."""
+
+    max_signal_staleness_days: int | None = None
+    """Per-sleeve override for the maximum signal age (in days).  ``None`` ⇒
+    fall back to the top-level :attr:`Config.max_signal_staleness_days`.  Resolve
+    the effective value via :meth:`Config.effective_staleness_days`."""
 
 
 class KeySourceConfig(BaseModel):
@@ -84,6 +111,19 @@ class RetryConfig(BaseModel):
     liquidity_safety: float = 1.0
     """Require opposing L2 depth >= required_size * liquidity_safety (within the
     max_order_slippage band) before firing an IOC; else defer the leg."""
+
+
+class SignalRecheckConfig(BaseModel):
+    """No-signal re-check window (see 2026-06-10 SP3 design spec §5)."""
+
+    enabled: bool = True
+    """When False, a no-signal HOLD consumes the day permanently (legacy)."""
+
+    interval_seconds: int = 180
+    """Minimum seconds between signal re-checks while the window is open."""
+
+    window_seconds: int = 7200
+    """Total re-check window from the first hold; expiry consumes the day."""
 
 
 class HealthConfig(BaseModel):
@@ -154,8 +194,26 @@ class Config(BaseModel):
       this mode ``subaccount_address`` MUST hold the MASTER EVM address the
       agent is approved on (no on-chain validation possible)."""
 
-    signal_source: SignalSourceConfig
-    """Allocation weight source configuration."""
+    signal_source: SignalSourceConfig | None = None
+    """Singular allocation source (the deployed long-only form).
+
+    Optional ONLY at the pydantic field level: the
+    ``_normalize_signal_sources`` validator enforces that EXACTLY ONE of
+    ``signal_source`` / ``signal_sources`` is provided (neither-present is
+    rejected, restoring the historical "required" semantics).  When the
+    singular form is used it stays populated here for legacy callers that read
+    ``cfg.signal_source.client_id`` directly — the adapter additionally
+    materializes it as the lone ``signal_sources`` sleeve named ``"default"``.
+    """
+
+    signal_sources: list[SignalSourceConfig] | None = None
+    """Multi-source (sleeves) allocation form (CRASH Phase 1).
+
+    A list of independent signed signals, each with its own ``budget`` /
+    ``allow_short``.  Mutually exclusive with ``signal_source`` (exactly one of
+    the two forms).  Downstream code reads sleeves via :meth:`sleeves`, NEVER
+    this raw field, so the singular path (normalized to one ``default`` sleeve)
+    and the list path are uniform from the consumer's perspective."""
 
     rebalance_utc_time: str
     """UTC wall-clock time for the daily rebalance trigger (``"HH:MM"`` format,
@@ -177,6 +235,9 @@ class Config(BaseModel):
     health: HealthConfig = HealthConfig()
     """Position-health monitor configuration."""
 
+    signal_recheck: SignalRecheckConfig = SignalRecheckConfig()
+    """No-signal re-check window configuration."""
+
     key_source: KeySourceConfig = KeySourceConfig()
     """Where the composition root loads the agent key from (keystore vs env_raw)."""
 
@@ -185,7 +246,20 @@ class Config(BaseModel):
     Target allocations are scaled to ``1 - safety_buffer`` of equity."""
 
     max_signal_staleness_days: int = 2
-    """Reject and halt if the signal payload is older than this many days."""
+    """Reject and halt if the signal payload is older than this many days.
+
+    This is the GLOBAL fallback; a sleeve may override it via
+    :attr:`SignalSourceConfig.max_signal_staleness_days`.  Resolve the
+    per-sleeve effective value via :meth:`effective_staleness_days`."""
+
+    liquidation_cooldown_days: int = 1
+    """Per-coin post-liquidation re-entry cooldown (in days).
+
+    After a position vanishes from the live snapshot WITHOUT a matching exit
+    order in the audit ledger (i.e. an isolated liquidation), the engine arms a
+    cooldown for that coin; same-direction re-entries within this many days are
+    skipped so the daemon does not re-open into the squeeze (red-team M3).
+    Default 1 day.  Consumed in Stage C (run_cycle)."""
 
     universe_perp_map: dict[str, str] = {}
     """Mapping from strategy coin ticker to Hyperliquid perpetual name.
@@ -374,19 +448,168 @@ class Config(BaseModel):
             )
         return self
 
+    @staticmethod
+    def _is_singular_echo(
+        singular: SignalSourceConfig,
+        sources: list[SignalSourceConfig],
+    ) -> bool:
+        """True iff ``sources`` is the idempotent echo of the singular adapter.
+
+        Distinguishes a re-validation round-trip (where ``model_dump`` carries
+        BOTH the original ``signal_source`` and the ``signal_sources`` list this
+        validator previously synthesized) from a genuine operator conflict.  The
+        echo is exactly one sleeve named ``"default"`` with budget 1.0 /
+        long-only whose wire fields match the singular block.
+        """
+        if len(sources) != 1:
+            return False
+        only = sources[0]
+        if not (
+            only.name == "default"
+            and only.budget == 1.0
+            and only.allow_short is False
+            and only.max_signal_staleness_days is None
+        ):
+            return False
+        # Wire fields must match the singular block (the adapter only overrides
+        # the sleeve-identity fields, copying everything else verbatim).
+        return (
+            only.type == singular.type
+            and only.url == singular.url
+            and only.token_ref == singular.token_ref
+            and only.root_key_fingerprint_ref == singular.root_key_fingerprint_ref
+            and only.client_id == singular.client_id
+        )
+
+    @model_validator(mode="after")
+    def _normalize_signal_sources(self) -> Config:
+        """Adapt the singular ``signal_source`` to the ``signal_sources`` list.
+
+        Enforces EXACTLY ONE of the two forms is provided, then materializes a
+        uniform ``signal_sources`` list so every downstream consumer (via
+        :meth:`sleeves`) sees the same shape:
+
+        * NEITHER present → ValueError (restores the historical "required"
+          semantics now that the pydantic field is optional);
+        * BOTH present → ValueError (the two forms are mutually exclusive);
+        * SINGULAR only → wrap a COPY of the block as one sleeve named
+          ``"default"`` with ``budget=1.0`` / ``allow_short=False`` (the whole
+          account, long-only).  ``signal_source`` stays populated so legacy
+          code reading ``cfg.signal_source.client_id`` keeps working;
+        * LIST only → validate ``budget``/name/short constraints and the
+          aggregate budget cap.
+
+        This runs BEFORE :meth:`_validate_mainnet_remote` (definition order) so
+        that validator can iterate the normalized sleeves uniformly.  It must
+        NOT touch the state-file paths — :meth:`_apply_data_dir` (defined later)
+        still owns the ``data_dir`` prefixing pass.
+        """
+        has_singular = self.signal_source is not None
+        has_list = self.signal_sources is not None
+
+        if not has_singular and not has_list:
+            raise ValueError(
+                "exactly one of `signal_source` (singular) or `signal_sources` "
+                "(list) must be provided; neither was set"
+            )
+        if has_singular and has_list:
+            # Both fields populated.  This is a CONFLICT *unless* the list is the
+            # idempotent echo this very validator wrote on a prior pass — i.e. a
+            # re-validation round-trip (``Config.model_validate(cfg.model_dump())``,
+            # used by the smoke harness to re-apply mutated fields).  In that case
+            # ``signal_sources`` is exactly the one ``default`` sleeve derived from
+            # ``signal_source``; accept it (re-derive idempotently below) rather
+            # than reject a config that already validated once.  A genuinely
+            # operator-supplied list alongside a singular block is rejected.
+            assert self.signal_source is not None  # narrowed by has_singular
+            assert self.signal_sources is not None  # narrowed by has_list
+            if not self._is_singular_echo(self.signal_source, self.signal_sources):
+                raise ValueError(
+                    "`signal_source` (singular) and `signal_sources` (list) are "
+                    "mutually exclusive; provide exactly one form"
+                )
+            # fall through to re-derive the canonical default sleeve
+
+        if has_singular:
+            # Singular adapter: one full-account long-only sleeve named
+            # "default".  model_copy(update=...) preserves every wire field
+            # (type/url/token_ref/root_key_fingerprint_ref/client_id) while
+            # pinning the sleeve identity fields.
+            assert self.signal_source is not None  # narrowed by has_singular
+            self.signal_sources = [
+                self.signal_source.model_copy(
+                    update={
+                        "name": "default",
+                        "budget": 1.0,
+                        "allow_short": False,
+                        "max_signal_staleness_days": None,
+                    }
+                )
+            ]
+            return self
+
+        # LIST form — validate the sleeves.
+        assert self.signal_sources is not None  # narrowed by has_list
+        sleeves = self.signal_sources
+
+        if not sleeves:
+            raise ValueError("`signal_sources` list must not be empty")
+
+        names = [s.name for s in sleeves]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"`signal_sources` sleeve names must be unique; duplicates: {dupes}"
+            )
+
+        bad_budgets = [s.name for s in sleeves if s.budget <= 0.0]
+        if bad_budgets:
+            raise ValueError(
+                "every sleeve `budget` must be > 0; offending sleeves: "
+                f"{bad_budgets}"
+            )
+
+        total_budget = sum(s.budget for s in sleeves)
+        if total_budget > 1.0 + 1e-9:
+            raise ValueError(
+                "sum of sleeve `budget` values must be <= 1.0 (the remainder is "
+                f"a permanent cash buffer); got {total_budget}"
+            )
+
+        short_non_remote = [
+            s.name for s in sleeves if s.allow_short and s.type != "remote"
+        ]
+        if short_non_remote:
+            raise ValueError(
+                "`allow_short=true` requires `type: remote`; offending sleeves: "
+                f"{short_non_remote}"
+            )
+
+        return self
+
     @model_validator(mode="after")
     def _validate_mainnet_remote(self) -> Config:
-        """Enforce that mainnet + remote source has both url and key fingerprint."""
-        if self.env == "mainnet" and self.signal_source.type == "remote":
+        """Enforce mainnet + remote sleeve has both url and key fingerprint.
+
+        Applies the rule PER SOURCE: every ``type=="remote"`` sleeve on mainnet
+        must carry both ``url`` and ``root_key_fingerprint_ref``.  Iterates the
+        normalized :meth:`sleeves` list so the singular and list forms share one
+        code path (the singular block surfaces as the lone ``default`` sleeve).
+        """
+        if self.env != "mainnet":
+            return self
+        for sleeve in self.sleeves():
+            if sleeve.type != "remote":
+                continue
             missing: list[str] = []
-            if not self.signal_source.url:
-                missing.append("signal_source.url")
-            if not self.signal_source.root_key_fingerprint_ref:
-                missing.append("signal_source.root_key_fingerprint_ref")
+            if not sleeve.url:
+                missing.append("url")
+            if not sleeve.root_key_fingerprint_ref:
+                missing.append("root_key_fingerprint_ref")
             if missing:
                 raise ValueError(
-                    "mainnet + remote signal_source requires both `url` and "
-                    f"`root_key_fingerprint_ref` to be set; missing: {missing}"
+                    f"mainnet + remote signal source '{sleeve.name}' requires both "
+                    f"`url` and `root_key_fingerprint_ref` to be set; missing: {missing}"
                 )
         return self
 
@@ -471,3 +694,26 @@ class Config(BaseModel):
             raise FileNotFoundError(f"Config file not found: {resolved}")
         raw: dict[str, Any] = yaml.safe_load(resolved.read_text(encoding="utf-8"))
         return cls(**raw)
+
+    def sleeves(self) -> list[SignalSourceConfig]:
+        """Return the normalized sleeve list (the ONE accessor downstream uses).
+
+        Always non-empty after validation: the singular ``signal_source`` form
+        is materialized into a single ``"default"`` sleeve by
+        :meth:`_normalize_signal_sources`, so both config forms present the same
+        shape to the source factory / combination layer.
+        """
+        # _normalize_signal_sources guarantees signal_sources is populated.
+        assert self.signal_sources is not None
+        return self.signal_sources
+
+    def effective_staleness_days(self, sleeve: SignalSourceConfig) -> int:
+        """Resolve the effective max signal age for ``sleeve``.
+
+        The per-sleeve :attr:`SignalSourceConfig.max_signal_staleness_days`
+        wins when set; otherwise fall back to the global
+        :attr:`max_signal_staleness_days`.
+        """
+        if sleeve.max_signal_staleness_days is not None:
+            return sleeve.max_signal_staleness_days
+        return self.max_signal_staleness_days

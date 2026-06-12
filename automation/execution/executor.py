@@ -11,9 +11,14 @@ Critical invariants:
 - Per-coin isolation: a single-coin failure (OrderRejected, RateLimited, or
   unexpected exception) logs the error and continues to the next coin — it
   does NOT abort the whole rebalance cycle.
-- Full exits (target_size=0, side="sell") use ``market_close`` (reduce-only)
-  in a SINGLE shot — reduce-only can't over-close, so we never drive the
-  size-residual retry loop for it (avoids double-counting fills).
+- Full exits (target_size=0, EITHER side — closing a short fully is a BUY)
+  use ``market_close`` (reduce-only) in a SINGLE shot — reduce-only can't
+  over-close, so we never drive the size-residual retry loop for it (avoids
+  double-counting fills).  The close-leg of a zero-crossing flip
+  (``is_close_leg=True``, red-team H4) routes through this same path; its
+  open-leg follows as a plain IOC anchored at flat — and is SUPPRESSED
+  (defer-recorded, cycle non-clean) whenever the close leg did not FULLY
+  fill, so no order ever fires against a non-flat book or crosses zero.
 - Pre-flight cap enforcement: before submitting ANY order, the whole order set
   is checked against ``cfg.caps`` (per-coin / total notional / turnover).  A
   CapBreach aborts the ENTIRE cycle BEFORE any submit (n_submitted=0, aborted).
@@ -310,7 +315,15 @@ def _preflight_caps(plan: SizePlan, cfg: Config) -> None:
     cap_orders: list[dict[str, Any]] = []
     for op in plan.orders:
         price = _price_of(op)
-        end_state_notional = abs(op.target_size * price)
+        # H4 flip dedupe: a flipping coin carries TWO legs.  The coin's
+        # END-STATE notional must be counted ONCE — the open-leg's
+        # |target|·px.  The close-leg's end state IS zero by construction
+        # (target_size == 0.0), but we zero it EXPLICITLY rather than rely on
+        # the multiplication: if the close-leg representation ever changes
+        # (e.g. partial flips carrying a nonzero close target), a silent
+        # double count of the coin's position value must not come back.
+        # Turnover legitimately counts BOTH legs' |delta| — both IOCs trade.
+        end_state_notional = 0.0 if op.is_close_leg else abs(op.target_size * price)
         cap_orders.append(
             {
                 "coin": op.coin,
@@ -503,10 +516,57 @@ def execute(
     # clients (no l2 book) byte-identical.
     marks: dict[str, Any] = client.marks() if liquidity_safety > 0.0 else {}
 
+    # H4 pair gating: coins whose plan carries a flip close-leg this cycle.
+    # The paired open leg is sized anchored-at-FLAT (delta = target − 0), so it
+    # may fire ONLY after its close leg FULLY filled.  ``close_leg_status``
+    # records each close leg's outcome as it executes.
+    flip_close_coins: set[str] = {o.coin for o in plan.orders if o.is_close_leg}
+    close_leg_status: dict[str, str] = {}
+
     for op in plan.orders:
         # D4 venue routing: a coin in spot_routing trades on its spot pair;
         # absent (or spot_routing=None) → PERP.  ``pair is None`` means PERP.
         pair = spot_routing.get(op.coin) if spot_routing else None
+
+        # ------------------------------------------------------------------
+        # H4 pair gating — suppress the open leg of an INCOMPLETE flip.
+        # If the close leg errored / throttled / liquidity-deferred / filled
+        # only PARTIALLY, the book is NOT flat: firing the flat-anchored open
+        # IOC would create transient wrong-direction exposure up to |pos| —
+        # and on a partial close the open IOC itself crosses zero, violating
+        # spec §7 (zero-crossing is ALWAYS two-legged with a reduce-only
+        # close).  Record the suppressed leg through the same defer channel
+        # the liquidity gate uses (no submit, no cloid, NOT an error) so the
+        # cycle is non-clean — the commit gate stays frozen and the retry
+        # window arms — and the next attempt re-plans from live positions,
+        # structurally re-deriving the correct residual legs.  Fail-closed:
+        # a close leg with NO recorded status (i.e. not yet executed — the
+        # sizer orders close-first, but this must not depend on that sort
+        # surviving future edits) also suppresses.
+        # ------------------------------------------------------------------
+        if (
+            not op.is_close_leg
+            and op.coin in flip_close_coins
+            and close_leg_status.get(op.coin) != "filled"
+        ):
+            _logger.warning(
+                "executor: open leg SUPPRESSED — paired close leg did not fully fill",
+                coin=op.coin,
+                close_status=close_leg_status.get(op.coin, "not-yet-run"),
+            )
+            results.append(
+                CoinResult(
+                    coin=op.coin,
+                    requested_size=abs(float(op.delta_size)),
+                    filled_size=0.0,
+                    attempts=0,
+                    status="skipped",
+                    cloids=[],
+                    error=None,
+                    liquidity_deferred=True,
+                )
+            )
+            continue
 
         # Pre-trade liquidity gate — SHARED across the daily AND retry paths
         # (both run through this single dispatch loop).  Just before a coin's
@@ -517,18 +577,28 @@ def execute(
                 op, client, marks, slippage=slippage, liquidity_safety=liquidity_safety
             )
             if deferred_leg is not None:
+                if op.is_close_leg:
+                    # A deferred close leg never reached the exchange — its
+                    # paired open leg must be suppressed below.
+                    close_leg_status[op.coin] = "deferred"
                 results.append(deferred_leg)
                 continue
 
-        is_full_exit = op.target_size == 0.0 and op.side == "sell"
+        # Full exit = target 0, SIDE-INDEPENDENT: a fully-closed SHORT is a
+        # BUY — the old ``and op.side == "sell"`` gate routed it to the
+        # residual-retry IOC path, losing reduce-only.  This also routes the
+        # close-leg of a flip (target 0 by construction) through market_close.
+        is_full_exit = op.target_size == 0.0
         if is_full_exit:
-            results.append(
-                _execute_full_exit(
-                    op, client, ledger, slippage,
-                    strategy_id=strategy_id, as_of=as_of, now_ts=now_ts,
-                    pair=pair,
-                )
+            res = _execute_full_exit(
+                op, client, ledger, slippage,
+                strategy_id=strategy_id, as_of=as_of, now_ts=now_ts,
+                pair=pair,
             )
+            if op.is_close_leg:
+                # Pair-gating input: the open leg fires ONLY on "filled".
+                close_leg_status[op.coin] = res.status
+            results.append(res)
         else:
             results.append(
                 _execute_ioc(
@@ -606,7 +676,7 @@ def _execute_full_exit(
     now_ts: str,
     pair: str | None = None,
 ) -> CoinResult:
-    """Execute a full exit (target_size==0, side="sell") — SINGLE shot.
+    """Execute a full exit (target_size==0, either side) — SINGLE shot.
 
     Venue routing (D4)
     ------------------
@@ -621,15 +691,26 @@ def _execute_full_exit(
     residual.  Driving the size-residual loop here would double-count fills
     across attempts (F-2).  Any short-fall is caught next cycle by the sizer's
     abs-drift backstop (which includes currently-held coins).
+
+    Flip close-leg cloid namespace (MF-6)
+    --------------------------------------
+    The close-leg of a flip shares coin + as_of + now_ts with its open-leg,
+    whose IOC loop starts at attempt_seq 0 — deriving the close cloid at
+    attempt 0 too would COLLIDE (duplicate cloid on-exchange; the second
+    ledger PENDING overwrites the first).  The close leg therefore sits at
+    attempt −1, a value the IOC retry loop (0..max_attempts−1) can never
+    produce.  Plain full exits (the coin's ONLY order this cycle) keep
+    attempt 0 — byte-identical cloids to before.
     """
-    cloid = make_cloid(strategy_id, as_of, op.coin, 0, now_ts)
+    attempt_seq = -1 if op.is_close_leg else 0
+    cloid = make_cloid(strategy_id, as_of, op.coin, attempt_seq, now_ts)
     cloids = [cloid]
     requested = abs(op.delta_size)
 
     # MF-7: write-before-submit.
     _record_pending(
         ledger, cloid=cloid, as_of=as_of, coin=op.coin,
-        target_w=op.target_size, attempt_seq=0, now_ts=now_ts,
+        target_w=op.target_size, attempt_seq=attempt_seq, now_ts=now_ts,
     )
 
     try:

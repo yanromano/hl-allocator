@@ -38,7 +38,12 @@ from automation.allocation.base import (
     TargetAllocation,
     validate_target_allocation,
 )
-from automation.core.config import Config
+from automation.allocation.sleeves import (
+    SleeveOutcome,
+    combine_sleeves,
+    resolve_outcome,
+)
+from automation.core.config import Config, SignalSourceConfig
 from automation.core.redaction import get_logger
 from automation.execution import reconciler, sizer
 from automation.execution.executor import ExecReport, execute
@@ -46,6 +51,13 @@ from automation.reporting.alerts import Alert, AlertSink, AlertType, Severity
 from automation.reporting.state import State, save
 from automation.runtime.intent_ledger import Intent, IntentLedger
 from automation.runtime.kill_switch import flatten_all
+
+#: The synthetic audience / client_id stamped on the COMBINED TargetAllocation.
+#: The per-sleeve audience guard already fired inside each sleeve's own
+#: ``validate_target_allocation`` (or the RemoteSignalSource's MF-17 check) during
+#: the fetch loop; the combined target is an internal construct that no longer
+#: carries any single sleeve's audience, so it validates against this constant.
+_COMBINED_AUDIENCE = "combined"
 
 _logger = get_logger(__name__)
 
@@ -119,6 +131,16 @@ class CycleReport:
 
     n_liquidity_deferred: int = 0
     """Legs the executor skipped for insufficient opposing depth (retryable)."""
+
+    sleeves: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Per-sleeve attribution for this cycle (CRASH Phase 1, spec §4.5).  Maps each
+    sleeve ``name`` → ``{"as_of": str | None, "weights": dict[str, float],
+    "outcome": "fresh" | "hold" | "stale"}``.  ``weights`` are the sleeve-relative
+    SIGNED weights that fed the combination (served weights for FRESH; the frozen
+    ``last_weights`` for HOLD; ``{}`` for STALE).  Written into the audit record so
+    each cycle's combined book can be attributed back to its sleeves WITHOUT
+    per-sleeve position bookkeeping (positions are fungible per-coin on HL).  Empty
+    ``{}`` on the no-good-signal / de-risk early returns (no combination ran)."""
 
 
 def _emit_alert(
@@ -303,10 +325,289 @@ def _handle_no_good_signal(
     )
 
 
+@dataclass(frozen=True)
+class _SleeveFetch:
+    """The outcome of fetching + validating ONE sleeve in the per-sleeve loop.
+
+    A FRESH fetch (``served_ok=True``) carries the validated ``TargetAllocation``;
+    a failed fetch carries the exception and whether it was an ``AllocationRejected``
+    (present-but-untrusted → ``INVALID_SIGNAL``) versus any other error
+    (unavailable → ``STALE_SIGNAL``).  The classification drives BOTH the per-sleeve
+    HOLD/STALE alert and — when EVERY sleeve fails — the legacy no-good-signal
+    routing (so the singular path's INVALID_SIGNAL / STALE_SIGNAL alerts and reason
+    strings are reproduced byte-for-byte).
+    """
+
+    sleeve: SignalSourceConfig
+    served_ok: bool
+    ta: TargetAllocation | None
+    exc: Exception | None
+    is_rejected: bool
+
+
+def _fetch_sleeve(
+    *,
+    cfg: Config,
+    sleeve: SignalSourceConfig,
+    source: AllocationSource,
+    as_of: datetime.date | None,
+) -> _SleeveFetch:
+    """Fetch + validate ONE sleeve's target allocation (spec §4.1).
+
+    Mirrors the legacy single-source fetch+validate block exactly so the singular
+    ("default") sleeve reproduces today's behaviour:
+      * fetch ``source.get_target_allocation(as_of)``;
+      * validate with THIS sleeve's ``client_id`` / ``allow_short`` and the global
+        whitelist (RemoteSignalSource also self-validates with the same args — the
+        re-validation here is a no-op for it but is the ONLY gate for the local
+        ``equal_weight`` / test sources);
+      * enforce the ``cfg.pinned_model_rev`` pin (remote NOGATE-TEST defense).
+
+    Never raises: any fetch/validation failure is captured into the returned
+    ``_SleeveFetch`` (``served_ok=False``) so the caller can apply the per-sleeve
+    HOLD/STALE staleness policy uniformly.  ``AllocationRejected`` is flagged
+    (``is_rejected=True``) to preserve the present-but-untrusted → INVALID_SIGNAL
+    routing.
+    """
+    whitelist = set(cfg.universe_perp_map) if cfg.universe_perp_map else None
+    client_id = sleeve.client_id or ""
+    try:
+        ta = source.get_target_allocation(as_of)
+        effective_whitelist = (
+            whitelist if whitelist is not None else set(ta.weights.keys())
+        )
+        validate_target_allocation(
+            ta,
+            max_per_asset=cfg.max_per_asset,
+            whitelist=effective_whitelist,
+            client_id=client_id,
+            allow_short=sleeve.allow_short,
+        )
+        # Model-rev pin for REMOTE sources (the local HaarpAllocationSource enforces
+        # its own pin at fetch; remote payloads had NO rev defense until this check).
+        # Mismatch routes through the AllocationRejected path (S-11: present-but-
+        # untrusted — the freshness clock does NOT advance).
+        if cfg.pinned_model_rev is not None and ta.model_rev != cfg.pinned_model_rev:
+            raise AllocationRejected(
+                f"model_rev pin mismatch: served '{ta.model_rev}' != pinned "
+                f"'{cfg.pinned_model_rev}'"
+            )
+    except AllocationRejected as exc:
+        _logger.warning(
+            "run_cycle: sleeve AllocationRejected — present but untrusted",
+            sleeve=sleeve.name,
+            error=str(exc),
+        )
+        return _SleeveFetch(
+            sleeve=sleeve, served_ok=False, ta=None, exc=exc, is_rejected=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "run_cycle: sleeve fetch failed — treating as unavailable",
+            sleeve=sleeve.name,
+            error=str(exc),
+        )
+        return _SleeveFetch(
+            sleeve=sleeve, served_ok=False, ta=None, exc=exc, is_rejected=False
+        )
+    return _SleeveFetch(
+        sleeve=sleeve, served_ok=True, ta=ta, exc=None, is_rejected=False
+    )
+
+
+def _within_staleness_window(
+    *,
+    cfg: Config,
+    sleeve: SignalSourceConfig,
+    state: State,
+    now_ts: str,
+) -> bool:
+    """Whether *sleeve* is still within its per-sleeve staleness window.
+
+    The anchor is the sleeve's own ``last_success_ts`` from the ledger; on the
+    FIRST cycle (no ledger entry yet) it falls back to ``state.first_cycle_ts``
+    (this deployment's boot), so a fresh deploy whose very first sleeve fetch
+    fails HOLDS within the window rather than de-risking immediately — mirroring
+    the global no-good-signal anchor logic.  The window length is
+    ``cfg.effective_staleness_days(sleeve)`` (per-sleeve override, else global).
+    """
+    rec = state.sleeves.get(sleeve.name) or {}
+    anchor: str = rec.get("last_success_ts") or state.first_cycle_ts or now_ts
+    now_dt = datetime.datetime.fromisoformat(now_ts)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=datetime.UTC)
+    anchor_dt = datetime.datetime.fromisoformat(anchor)
+    if anchor_dt.tzinfo is None:
+        anchor_dt = anchor_dt.replace(tzinfo=datetime.UTC)
+    age_days = (now_dt - anchor_dt).total_seconds() / 86400.0
+    return bool(age_days <= cfg.effective_staleness_days(sleeve))
+
+
+def _normalize_sources(
+    sources: AllocationSource | dict[str, AllocationSource],
+) -> dict[str, AllocationSource]:
+    """Accept the legacy single source OR the multi-sleeve dict; return the dict.
+
+    The plumbing change keeps ``run_cycle``'s third positional parameter
+    byte-compatible: every existing caller (and ``test_rebalance.py``) passes a
+    bare ``AllocationSource`` there, which is wrapped into the lone ``"default"``
+    sleeve — the SAME name the singular ``signal_source`` config normalizes to via
+    ``cfg.sleeves()``.  A new daemon passes the ``build_sources(cfg)`` dict directly.
+    """
+    if isinstance(sources, dict):
+        return sources
+    return {"default": sources}
+
+
+def _detect_liquidations(
+    *,
+    cfg: Config,
+    state: State,
+    snap: Any,
+    now_ts: str,
+    state_path: str | Path,
+    alert_sink: AlertSink | None,
+) -> None:
+    """Detect isolated liquidations and arm a per-coin re-entry cooldown (M3).
+
+    HEURISTIC (spec §5, red-team M3)
+    --------------------------------
+    A coin is treated as LIQUIDATED when ALL of:
+
+      * it carries a NONZERO weight in ``state.last_rebalanced_target`` (the FROZEN
+        baseline — the last target we actually committed), AND
+      * its live position in ``snap.positions`` is ABSENT or zero (the book is flat
+        for it), AND
+      * it is not already under a cooldown (idempotent — don't re-arm / re-alert a
+        coin we already flagged on a prior cycle while it stays flat).
+
+    WHY this is the honest "our exit" signal
+    -----------------------------------------
+    The committed baseline is the SOLE record of what we last *intentionally* held.
+    When WE close a coin, ``run_cycle`` commits the new target — which records that
+    coin at ``0.0`` (or drops it) — so a coin we deliberately flattened has a
+    baseline weight of ``0`` and is NOT flagged.  Only a coin whose baseline is
+    still NONZERO yet has vanished from the book was closed by SOMETHING ELSE — an
+    isolated liquidation (the daemon submits no order between the prior commit and
+    this snapshot, so the engine itself cannot have produced the flat).
+
+    FALSE-POSITIVE BOUND
+    --------------------
+    Detection runs at the TOP of the cycle, before any order for THIS cycle fires,
+    so an order we are about to place can never masquerade as a liquidation.  The
+    ONLY residual false positive is a coin whose close we submitted on a PRIOR
+    cycle that executed DIRTY (so the baseline stayed frozen at the old nonzero
+    target) yet actually filled — leaving a nonzero baseline against a flat book.
+    That is a narrow operator-intervention / partial-failure edge, and the
+    consequence is conservative-safe: arming a (default 1-day) SAME-DIRECTION
+    cooldown only blocks RE-OPENING the same side — it never forces a trade and
+    never blocks an exit or an opposite-direction flip.  The cost of a false
+    positive is at most a one-day delayed same-direction re-entry; the cost of a
+    false negative is feeding fresh margin into an active squeeze.  We bias toward
+    the cheaper error.
+
+    Side effects: mutates ``state.liq_cooldowns`` and persists, emits one
+    ``POSITION_LIQUIDATED`` CRITICAL per newly-detected coin.  Pure-flat books and
+    all-zero baselines are no-ops.
+    """
+    baseline = state.last_rebalanced_target
+    if not baseline:
+        return
+    today_iso = datetime.datetime.fromisoformat(now_ts).date().isoformat()
+    newly_flagged: list[str] = []
+    for ticker, w in baseline.items():
+        if w == 0.0:
+            continue
+        if ticker in state.liq_cooldowns:
+            # Already under cooldown — don't re-arm or re-alert while it stays flat.
+            continue
+        perp = cfg.universe_perp_map.get(ticker, ticker)
+        live = snap.positions.get(perp)
+        live_f = float(live) if live is not None else 0.0
+        if live_f == 0.0:
+            # Baseline says we hold it; the book says we don't, and we issued no
+            # order to flatten it → liquidated.
+            state.liq_cooldowns[ticker] = today_iso
+            newly_flagged.append(ticker)
+            _emit_alert(
+                alert_sink,
+                AlertType.POSITION_LIQUIDATED,
+                Severity.CRITICAL,
+                f"position {ticker!r} vanished from the book with no exit order of "
+                "ours — apparent liquidation; arming re-entry cooldown",
+                {
+                    "coin": ticker,
+                    "baseline_weight": w,
+                    "cooldown_date": today_iso,
+                    "liquidation_cooldown_days": cfg.liquidation_cooldown_days,
+                },
+            )
+    if newly_flagged:
+        save(state, state_path)
+
+
+def _cooldown_blocked_set(
+    *,
+    cfg: Config,
+    state: State,
+    combined_weights: dict[str, float],
+    now_ts: str,
+    state_path: str | Path,
+) -> frozenset[str]:
+    """Compute the SAME-DIRECTION cooldown skip set; expire stale cooldowns (M3).
+
+    For each coin in ``state.liq_cooldowns``:
+
+      * EXPIRED (``today − cooldown_date >= cfg.liquidation_cooldown_days``) →
+        dropped from the map (and persisted) so it trades normally and the entry
+        clears.  A zero-day cooldown therefore expires the very next calendar day.
+      * ACTIVE → blocked ONLY when the NEW combined target re-enters in the SAME
+        direction as the liquidated position.  The liquidated direction is the sign
+        of the coin in ``state.last_rebalanced_target`` (the committed baseline,
+        which preserves the last-acted direction across the cooldown — a
+        same-direction re-entry is skipped-but-committed, so the baseline sign is
+        sticky).  An OPPOSITE-direction re-entry (the squeeze flipped the thesis)
+        is intentionally NOT blocked; a target that gave the coin up (sign 0 / no
+        entry) has nothing to block either.
+
+    Returns a TICKER-space frozenset the sizer drops from the traded set.  Side
+    effect: persists ``state`` when any expired cooldown is cleared.
+    """
+    if not state.liq_cooldowns:
+        return frozenset()
+    today = datetime.datetime.fromisoformat(now_ts).date()
+    baseline = state.last_rebalanced_target or {}
+    blocked: set[str] = set()
+    expired: list[str] = []
+    for ticker, date_iso in list(state.liq_cooldowns.items()):
+        age_days = (today - datetime.date.fromisoformat(date_iso)).days
+        if age_days >= cfg.liquidation_cooldown_days:
+            expired.append(ticker)
+            continue
+        liq_dir = _sign(baseline.get(ticker, 0.0))
+        new_dir = _sign(combined_weights.get(ticker, 0.0))
+        if new_dir != 0 and new_dir == liq_dir:
+            blocked.add(ticker)
+    if expired:
+        for ticker in expired:
+            del state.liq_cooldowns[ticker]
+        save(state, state_path)
+    return frozenset(blocked)
+
+
+def _sign(x: float) -> int:
+    """Sign of *x* as an int in ``{-1, 0, 1}`` (0 for exactly zero / NaN-safe ==)."""
+    if x > 0.0:
+        return 1
+    if x < 0.0:
+        return -1
+    return 0
+
+
 def run_cycle(
     cfg: Config,
     client: Any,
-    source: AllocationSource,
+    sources: AllocationSource | dict[str, AllocationSource],
     ledger: IntentLedger,
     state: State,
     state_path: str | Path,
@@ -315,6 +616,7 @@ def run_cycle(
     as_of: datetime.date | None = None,
     is_filled: Callable[[Intent], bool] | None = None,
     alert_sink: AlertSink | None = None,
+    sleeve_configs: list[SignalSourceConfig] | None = None,
 ) -> CycleReport:
     """Execute one live rebalance cycle.
 
@@ -322,12 +624,18 @@ def run_cycle(
     -----
     0. Boot-time reconciliation of any PENDING intents from a prior crash.
     1. Fetch an on-chain snapshot (failure propagates — cannot act blind).
-    2. Retrieve the target allocation.  On fetch failure → staleness logic.
-    3. Validate the target allocation.  On validation failure → staleness logic.
-    4. Record freshness: update ``state.last_successful_signal_ts`` + persist.
-    5. Compute the size plan.
+    2. Per-sleeve fetch + validate + status resolution (FRESH / HOLD / STALE).
+    3. Combine sleeves → ONE synthetic combined TargetAllocation + frozen coins.
+    4. Record freshness + per-sleeve ledger writes.
+    5. Compute the size plan (combined target, allow_short, frozen coins).
     6. Execute orders (only if plan.rebalance is True).
-    7. Commit the frozen new target to persistent state (only if rebalanced clean).
+    7. Commit the frozen new COMBINED target to persistent state (if clean).
+
+    ``sleeve_configs`` overrides ``cfg.sleeves()`` for the per-sleeve loop — the
+    bounded-retry path (``retry_attempt``) passes a SINGLE synthetic combined
+    sleeve so the frozen (possibly SIGNED) combined target re-drives through the
+    same machinery without re-deriving per-source sleeves.  ``None`` ⇒ the normal
+    ``cfg.sleeves()`` (the deployed path).
 
     Parameters
     ----------
@@ -396,85 +704,326 @@ def run_cycle(
     # Step 1: Snapshot (failure PROPAGATES — we cannot act without reading positions).
     snap = reconciler.snapshot(client, spot_routing=spot_routing)
 
-    # Steps 2-3: Fetch + validate.  Both failure modes route to staleness logic.
+    # Step 1b: Liquidation detection (CRASH Phase 1, spec §5 / red-team M3).  Runs
+    # BEFORE the per-sleeve fetch + plan so a newly-armed cooldown gates THIS cycle's
+    # re-entry: a coin nonzero in the committed baseline but absent from the live
+    # book (with no exit order of ours) was liquidated → arm a same-direction
+    # re-entry cooldown + emit CRITICAL.  No-op on a flat book or all-zero baseline.
+    _detect_liquidations(
+        cfg=cfg,
+        state=state,
+        snap=snap,
+        now_ts=now_ts,
+        state_path=state_path,
+        alert_sink=alert_sink,
+    )
+
+    # Normalize the source argument: the legacy single-source positional binds to a
+    # one-element {"default": source} dict (byte-compatible with every existing
+    # caller and test_rebalance.py); a new daemon passes the multi-sleeve dict.
+    sources_by_name = _normalize_sources(sources)
+
+    # The sleeve set to iterate: cfg.sleeves() (deployed path) unless the retry
+    # path overrode it with a single synthetic combined sleeve.
+    sleeves_list = sleeve_configs if sleeve_configs is not None else cfg.sleeves()
+
+    # ----------------------------------------------------------------------------
+    # Steps 2-3: PER-SLEEVE fetch + validate + status resolution (spec §4.1, §4.3).
+    #
+    # Iterate cfg.sleeves() in DETERMINISTIC config order.  For each sleeve: fetch +
+    # validate (the sleeve's own client_id / allow_short / model-rev pin), then
+    # resolve its status (FRESH / HOLD / STALE) under the per-sleeve staleness
+    # policy.  A HOLD sleeve is FROZEN: we rebuild its outcome from the ledger's
+    # last_weights so combine_sleeves freezes exactly those coins (resolve_outcome
+    # returns {} for a hold — the daemon supplies the frozen weights).  A STALE
+    # sleeve contributes {} and unwinds via the combined delta.
+    #
+    # For the singular ("default") sleeve this reproduces the legacy single-source
+    # fetch behaviour exactly (one sleeve, budget 1.0, allow_short False, no frozen
+    # coins) so the deployed long-only path stays byte-compatible.
+    # ----------------------------------------------------------------------------
+    outcomes: list[SleeveOutcome] = []
+    sleeve_audit: dict[str, dict[str, Any]] = {}
+    new_holds: dict[str, int] = {}
+    fresh_served: dict[str, dict[str, float]] = {}   # name → served weights
+    fresh_as_of: dict[str, datetime.date] = {}       # name → served as_of
+    fresh_strategy_ids: list[str] = []               # FRESH sleeves' strategy ids
+    any_short = False
+    failures: list[_SleeveFetch] = []
+
+    for sleeve in sleeves_list:
+        source = sources_by_name.get(sleeve.name)
+        if source is None:
+            # A configured sleeve has no built source — fail-closed as unavailable
+            # (treated like a fetch failure so the staleness policy applies rather
+            # than crashing the whole cycle for the OTHER sleeves).
+            failures.append(
+                _SleeveFetch(
+                    sleeve=sleeve,
+                    served_ok=False,
+                    ta=None,
+                    exc=KeyError(f"no source built for sleeve {sleeve.name!r}"),
+                    is_rejected=False,
+                )
+            )
+            fetch = failures[-1]
+        else:
+            fetch = _fetch_sleeve(
+                cfg=cfg, sleeve=sleeve, source=source, as_of=as_of
+            )
+            if not fetch.served_ok:
+                failures.append(fetch)
+
+        prior = state.sleeves.get(sleeve.name) or {}
+        prior_holds = int(prior.get("consecutive_holds", 0))
+        within = _within_staleness_window(
+            cfg=cfg, sleeve=sleeve, state=state, now_ts=now_ts
+        )
+        served_w = dict(fetch.ta.weights) if (fetch.served_ok and fetch.ta) else {}
+        outcome, holds = resolve_outcome(
+            served_ok=fetch.served_ok,
+            weights=served_w,
+            allow_short=sleeve.allow_short,
+            budget=sleeve.budget,
+            name=sleeve.name,
+            consecutive_holds=prior_holds,
+            within_staleness_window=within,
+        )
+        new_holds[sleeve.name] = holds
+        any_short = any_short or sleeve.allow_short
+
+        if outcome.status == "fresh" and fetch.ta is not None:
+            fresh_served[sleeve.name] = served_w
+            fresh_as_of[sleeve.name] = fetch.ta.as_of
+            fresh_strategy_ids.append(fetch.ta.strategy_id)
+            sleeve_audit[sleeve.name] = {
+                "as_of": fetch.ta.as_of.isoformat(),
+                "weights": dict(served_w),
+                "outcome": "fresh",
+            }
+        elif outcome.status == "hold":
+            # FREEZE-NOTIONAL: resolve_outcome returns {} for a hold; supply the
+            # ledger's last_weights so combine_sleeves freezes exactly those coins.
+            frozen_w = dict(prior.get("last_weights") or {})
+            outcome = SleeveOutcome(
+                name=sleeve.name,
+                status="hold",
+                weights=frozen_w,
+                budget=sleeve.budget,
+                allow_short=sleeve.allow_short,
+            )
+            sleeve_audit[sleeve.name] = {
+                "as_of": prior.get("last_as_of"),
+                "weights": frozen_w,
+                "outcome": "hold",
+            }
+        else:  # stale
+            sleeve_audit[sleeve.name] = {
+                "as_of": prior.get("last_as_of"),
+                "weights": {},
+                "outcome": "stale",
+            }
+        outcomes.append(outcome)
+
+    # ----------------------------------------------------------------------------
+    # ALL sleeves HOLD/STALE → no fresh signal this cycle → the existing
+    # no-good-signal path (SP3 recheck machinery unchanged).  Reproduce the
+    # singular path's INVALID_SIGNAL vs STALE_SIGNAL routing: if the FIRST failing
+    # sleeve was an AllocationRejected (present-but-untrusted) use INVALID_SIGNAL,
+    # else STALE_SIGNAL.  The per-sleeve ledger (consecutive_holds) is persisted
+    # FIRST so a sustained dark short still escalates to STALE on the next cycle.
+    # ----------------------------------------------------------------------------
+    if not fresh_served:
+        for name, holds in new_holds.items():
+            rec = state.sleeves.get(name)
+            if rec is not None:
+                rec["consecutive_holds"] = holds
+        save(state, state_path)
+        first_fail = failures[0] if failures else None
+        if first_fail is not None and first_fail.is_rejected:
+            alert_type = AlertType.INVALID_SIGNAL
+            reason_prefix = f"invalid signal: {first_fail.exc}"
+        else:
+            alert_type = AlertType.STALE_SIGNAL
+            exc_txt = first_fail.exc if first_fail is not None else "no fresh sleeve"
+            reason_prefix = f"signal unavailable: {exc_txt}"
+        return _handle_no_good_signal(
+            cfg=cfg,
+            client=client,
+            ledger=ledger,
+            state=state,
+            state_path=state_path,
+            now_ts=now_ts,
+            alert_sink=alert_sink,
+            alert_type=alert_type,
+            reason_prefix=reason_prefix,
+            unresolved=unresolved,
+        )
+
+    # ----------------------------------------------------------------------------
+    # Step 3b: Per-sleeve HOLD / DE-RISK alerts (spec §4.3, red-team L1).
+    # ----------------------------------------------------------------------------
+    for sleeve in sleeves_list:
+        if sleeve_audit[sleeve.name]["outcome"] == "hold":
+            _emit_alert(
+                alert_sink,
+                AlertType.SLEEVE_HOLD,
+                Severity.WARNING,
+                f"sleeve {sleeve.name!r} HELD — coins frozen this cycle",
+                {
+                    "sleeve": sleeve.name,
+                    "consecutive_holds": new_holds[sleeve.name],
+                    "frozen_coins": sorted(sleeve_audit[sleeve.name]["weights"].keys()),
+                },
+            )
+
+    # Emit SLEEVE_DERISKED only when a sleeve that PREVIOUSLY held inventory goes
+    # stale — a never-served sleeve going "stale" carries no positions to unwind,
+    # so the CRITICAL would be noise.  We approximate "had inventory" via the
+    # ledger's last_weights (the stale sleeve's prior committed exposure).
+    for sleeve in sleeves_list:
+        if sleeve_audit[sleeve.name]["outcome"] != "stale":
+            continue
+        prior = state.sleeves.get(sleeve.name) or {}
+        had_inventory = bool(prior.get("last_weights"))
+        if had_inventory:
+            _emit_alert(
+                alert_sink,
+                AlertType.SLEEVE_DERISKED,
+                Severity.CRITICAL,
+                f"sleeve {sleeve.name!r} STALE — de-risking its coins to cash",
+                {
+                    "sleeve": sleeve.name,
+                    "consecutive_holds": new_holds[sleeve.name],
+                    "unwound_coins": sorted((prior.get("last_weights") or {}).keys()),
+                },
+            )
+
+    # ----------------------------------------------------------------------------
+    # Step 3c: COMBINE → one synthetic combined TargetAllocation (spec §4.3, §4.4).
+    # ----------------------------------------------------------------------------
+    combined = combine_sleeves(outcomes)
+    combined_weights = combined.weights
+    frozen_coins = combined.frozen_coins
+
+    # cash = 1 − Σ|combined| — the UNENCUMBERED fraction of the TRADED target.
+    # NOTE on accounting: frozen sleeves are NOT in ``combined_weights`` so they do
+    # NOT reduce this cash figure here; their budget is held by their LIVE positions
+    # (carried untouched) and is folded into the sizer's gross-cap math via the
+    # frozen-coin live |notional|.  So "cash" is the unencumbered slice of the
+    # traded book, not the account-wide cash.
+    combined_gross = sum(abs(w) for w in combined_weights.values())
+    combined_cash = 1.0 - combined_gross
+
+    # The combined as_of: all sleeves share the 00:00 UTC daily close calendar, so
+    # use the explicit cycle ``as_of`` when provided, else the (consistent) served
+    # as_of from the fresh sleeves.  ``ta.as_of`` drives data_age_days + the
+    # executor's as_of stamp + the audit record.
+    combined_as_of = as_of if as_of is not None else next(iter(fresh_as_of.values()))
+
+    # Synthetic strategy_id: "+"-join the FRESH sleeves' strategy ids (config
+    # order).  For the singular path this is exactly the lone sleeve's strategy_id
+    # (e.g. "haarp"), so the executor's cloid prefix is byte-compatible.
+    combined_strategy_id = "+".join(fresh_strategy_ids)
+
+    ta = TargetAllocation(
+        as_of=combined_as_of,
+        weights=combined_weights,
+        cash=combined_cash,
+        strategy_id=combined_strategy_id,
+        model_rev="combined",
+        audience=_COMBINED_AUDIENCE,
+    )
+
+    # Validate the COMBINED target with allow_short = any sleeve allows shorts and
+    # the COMBINED gross rule (Σ|w| ≤ 1).  Frozen coins are absent from the combined
+    # weights so they are not validated here (they carry no new target this cycle).
+    # The whitelist is the global universe (or the combined weights' coins when the
+    # universe is empty, mirroring the per-sleeve fallback).
     whitelist = set(cfg.universe_perp_map) if cfg.universe_perp_map else None
-    client_id = cfg.signal_source.client_id or ""
+    effective_whitelist = (
+        whitelist if whitelist is not None else set(combined_weights.keys())
+    )
+    validate_target_allocation(
+        ta,
+        max_per_asset=cfg.max_per_asset,
+        whitelist=effective_whitelist,
+        client_id=_COMBINED_AUDIENCE,
+        allow_short=any_short,
+    )
 
-    ta = None
-    try:
-        ta = source.get_target_allocation(as_of)
-        # Temporarily compute whitelist from TA if universe_perp_map is empty.
-        effective_whitelist = whitelist if whitelist is not None else set(ta.weights.keys())
-        validate_target_allocation(
-            ta,
-            max_per_asset=cfg.max_per_asset,
-            whitelist=effective_whitelist,
-            client_id=client_id,
-        )
-    except AllocationRejected as exc:
-        # Present-but-UNTRUSTED signal (S-11): do NOT update freshness clock.
-        _logger.warning(
-            "run_cycle: AllocationRejected — signal present but untrusted",
-            error=str(exc),
-        )
-        return _handle_no_good_signal(
-            cfg=cfg,
-            client=client,
-            ledger=ledger,
-            state=state,
-            state_path=state_path,
-            now_ts=now_ts,
-            alert_sink=alert_sink,
-            alert_type=AlertType.INVALID_SIGNAL,
-            reason_prefix=f"invalid signal: {exc}",
-            unresolved=unresolved,
-        )
-    except Exception as exc:
-        # Signal unavailable (network error, SignalRejected, etc.).
-        _logger.warning(
-            "run_cycle: signal fetch failed — treating as unavailable",
-            error=str(exc),
-        )
-        return _handle_no_good_signal(
-            cfg=cfg,
-            client=client,
-            ledger=ledger,
-            state=state,
-            state_path=state_path,
-            now_ts=now_ts,
-            alert_sink=alert_sink,
-            alert_type=AlertType.STALE_SIGNAL,
-            reason_prefix=f"signal unavailable: {exc}",
-            unresolved=unresolved,
-        )
-
-    # Step 4: Record freshness — good signal (fetched + validated).
-    # Persist even on a hold so the staleness clock advances correctly.
+    # Step 4: Record freshness + per-sleeve ledger writes.  At least one sleeve
+    # served fresh this cycle → advance the global staleness clock (kept in sync
+    # for the legacy single-source path) and persist each sleeve's ledger:
+    #   FRESH → {last_weights, last_as_of, last_success_ts: now, consecutive_holds:0}
+    #   HOLD  → keep last_weights, bump consecutive_holds (no last_success_ts move)
+    #   STALE → keep last_weights (de-risk is via the combined delta, not the ledger)
+    #
+    # Skip the write for any sleeve NOT in the real config (C5-review cleanup): the
+    # bounded-retry path drives the cycle with a SINGLE synthetic ``"default"``
+    # sleeve (``sleeve_configs=[retry_sleeve]``) that does not correspond to any
+    # configured source.  Writing ``state.sleeves["default"]`` for it on a
+    # multi-sleeve deployment would inject a phantom ledger record that no real
+    # sleeve owns (it would never be read by the per-sleeve staleness clock, but it
+    # pollutes the persisted state and any audit of the sleeve map).  The singular
+    # config DOES name its lone sleeve ``"default"``, so that path is unaffected.
+    configured_sleeve_names = {s.name for s in cfg.sleeves()}
     state.last_successful_signal_ts = now_ts
+    for sleeve in sleeves_list:
+        name = sleeve.name
+        if name not in configured_sleeve_names:
+            continue
+        status = sleeve_audit[name]["outcome"]
+        rec = state.sleeves.get(name)
+        if status == "fresh":
+            state.sleeves[name] = {
+                "last_weights": dict(fresh_served[name]),
+                "last_as_of": fresh_as_of[name].isoformat(),
+                "last_success_ts": now_ts,
+                "consecutive_holds": 0,
+            }
+        elif rec is not None:
+            # HOLD / STALE: keep last_weights; sync the consecutive_holds counter.
+            rec["consecutive_holds"] = new_holds[name]
     save(state, state_path)
 
-    # The served target weights — carried on EVERY CycleReport return from here
-    # on (the signal-failure early returns above keep the None default).  The
-    # daemon stashes this as ``retry_target`` when opening a bounded-retry window.
-    served_weights = dict(ta.weights)
+    # The combined SIGNED weights — carried on EVERY CycleReport return from here.
+    # The daemon stashes this as ``retry_target`` when opening a bounded-retry
+    # window (the retry freezes the COMBINED target, spec §4.5).
+    served_weights = dict(combined_weights)
 
     # FORENSIC STAMP (observability only, NO ALERT): how stale the served bar was,
-    # in whole days = (now.date() - ta.as_of).days.  On the success path the daemon
-    # passes as_of = scheduler.expected_as_of and HaarpAllocationSource enforces a
-    # STRICT raw.as_of == as_of, so this is essentially always exactly 1 (the normal
-    # closed-daily-bar lag) — a "pre-stale" alert would never fire here, so we only
-    # record the age for the audit trail.  ``now_ts`` is ISO (possibly naive → coerce
-    # to UTC, mirroring _handle_no_good_signal); ``ta.as_of`` is a datetime.date.
+    # in whole days = (now.date() - ta.as_of).days.  ``now_ts`` is ISO (possibly
+    # naive → coerce to UTC, mirroring _handle_no_good_signal).
     now_dt_good = datetime.datetime.fromisoformat(now_ts)
     if now_dt_good.tzinfo is None:
         now_dt_good = now_dt_good.replace(tzinfo=datetime.UTC)
     data_age_days = (now_dt_good.date() - ta.as_of).days
 
-    # Recompute effective_whitelist for sizer (ta is guaranteed non-None here).
-    effective_whitelist = whitelist if whitelist is not None else set(ta.weights.keys())
-
-    # Step 5: Size plan.
-    sp = sizer.plan(ta, snap, state, cfg)
+    # Step 5: Size plan — ONE combined target, allow_short if any sleeve allows it,
+    # excluding the frozen coins (carried untouched; their live notional still
+    # counts toward the gross cap inside the sizer) and any SAME-DIRECTION
+    # cooldown-blocked coins (red-team M3): a coin whose unexpired liquidation
+    # cooldown matches the new target's direction is dropped from the traded set so
+    # we never re-open into a squeeze.  Expired cooldowns are cleared here (so the
+    # entry trades normally and the map self-prunes); opposite-direction re-entries
+    # pass through (the flip is a new thesis).
+    cooldown_blocked = _cooldown_blocked_set(
+        cfg=cfg,
+        state=state,
+        combined_weights=combined_weights,
+        now_ts=now_ts,
+        state_path=state_path,
+    )
+    sp = sizer.plan(
+        ta,
+        snap,
+        state,
+        cfg,
+        allow_short=any_short,
+        frozen_coins=frozen_coins,
+        cooldown_blocked=cooldown_blocked,
+    )
 
     # G4a: MIN_NOTIONAL_UNALLOCATED — coins the strategy WANTS that were silently
     # skipped by the sizer (below_min_notional or zeroed_by_cap).  Emit BEFORE the
@@ -514,6 +1063,7 @@ def run_cycle(
             data_age_days=data_age_days,
             target_weights=served_weights,
             n_liquidity_deferred=0,
+            sleeves=sleeve_audit,
         )
 
     exec_report = execute(
@@ -559,6 +1109,7 @@ def run_cycle(
             data_age_days=data_age_days,
             target_weights=served_weights,
             n_liquidity_deferred=exec_report.n_liquidity_deferred,
+            sleeves=sleeve_audit,
         )
 
     # MF-9 mid-cycle: THROTTLE alert when any coin was rate-limited (non-deferred path).
@@ -635,7 +1186,14 @@ def run_cycle(
         target_by_perp = {
             cfg.universe_perp_map.get(t, t): w for t, w in ta.weights.items()
         }
-        perps = set(target_by_perp) | set(achieved)
+        # EXCLUDE frozen coins from the divergence set (spec §4.3): a held sleeve's
+        # live position appears in ``achieved`` but is intentionally absent from the
+        # combined target — counting it would report the full frozen weight as
+        # "divergence" every cycle the sleeve is dark, which is noise, not drift.
+        frozen_perps_div = {
+            cfg.universe_perp_map.get(c, c) for c in frozen_coins
+        }
+        perps = (set(target_by_perp) | set(achieved)) - frozen_perps_div
         max_dev = max(
             (abs(target_by_perp.get(p, 0.0) - achieved.get(p, 0.0)) for p in perps),
             default=0.0,
@@ -680,6 +1238,7 @@ def run_cycle(
         data_age_days=data_age_days,
         target_weights=served_weights,
         n_liquidity_deferred=exec_report.n_liquidity_deferred,
+        sleeves=sleeve_audit,
     )
 
 
@@ -687,9 +1246,17 @@ class _FrozenSource:
     """An ``AllocationSource`` serving a fixed, pre-computed target.
 
     Used by ``retry_attempt`` to drive ``run_cycle`` toward the frozen
-    ``retry_target`` WITHOUT re-fetching the signal.  The served allocation is
-    all-risk (``cash = 1 - sum(weights)``), echoing the strategy_id/audience the
-    executor expects so ``validate_target_allocation`` passes the audience guard.
+    ``retry_target`` WITHOUT re-fetching the signal.  The served allocation
+    echoes the strategy_id/audience the executor expects so
+    ``validate_target_allocation`` passes the audience guard.
+
+    cash = ``1 − Σ|w|`` (red-team H1): the retry target is the COMBINED target,
+    which may carry SIGNED (short) weights.  The naive ``1 − Σw`` would yield
+    ``cash > 1`` for a net-short target (e.g. a single ``−0.4`` short → cash
+    ``1.4``), and the allow_short unity check (``Σ|w| + cash == 1``) would then
+    REJECT the retry — silently breaking the bounded-retry recovery for any
+    cycle whose combined book was net-short.  Summing magnitudes makes the
+    served allocation a valid signed target for both long-only and signed retries.
     """
 
     def __init__(
@@ -713,7 +1280,7 @@ class _FrozenSource:
         return TargetAllocation(
             as_of=self._as_of,
             weights=dict(self._weights),
-            cash=1.0 - sum(self._weights.values()),
+            cash=1.0 - sum(abs(w) for w in self._weights.values()),
             strategy_id=self._strategy_id,
             model_rev=self._model_rev,
             audience=self._client_id,
@@ -740,13 +1307,20 @@ def retry_attempt(
     structural: the sizer computes the delta from LIVE positions, so an
     already-filled leg yields 0 orders.
 
+    The retry freezes the COMBINED target (spec §4.5), so it bypasses the
+    per-sleeve fetch loop: it drives ``run_cycle`` with a SINGLE synthetic
+    ``"default"`` sleeve (``sleeve_configs=[...]``) whose ``allow_short`` is the
+    OR of every real sleeve's flag — so a signed (net-short) combined retry
+    validates and sizes correctly.  Its ``client_id`` matches the
+    ``_FrozenSource`` audience so the per-sleeve audience guard passes.
+
     Parameters
     ----------
     cfg, client, ledger, state, state_path, now_ts, alert_sink, is_filled:
         Forwarded verbatim to ``run_cycle``.
     retry_target:
-        The frozen target weights to retry toward (the served allocation whose
-        residual leg was liquidity-deferred on the daily cycle).
+        The frozen COMBINED target weights to retry toward (the served combined
+        allocation whose residual leg was liquidity-deferred on the daily cycle).
     retry_as_of:
         ISO date string of the frozen allocation.  Becomes the ``ta.as_of`` of
         the synthetic ``TargetAllocation`` and the ``as_of`` reference forwarded
@@ -757,10 +1331,24 @@ def retry_attempt(
     CycleReport
         Same shape as a normal ``run_cycle`` report.
     """
+    any_short = any(s.allow_short for s in cfg.sleeves())
     source = _FrozenSource(
         retry_target,
         retry_as_of,
-        client_id=cfg.signal_source.client_id or "",
+        client_id=_COMBINED_AUDIENCE,
+    )
+    # A single synthetic combined sleeve — drives the per-sleeve loop with the
+    # frozen combined target as the lone "fresh" sleeve (no real per-source fetch).
+    retry_sleeve = SignalSourceConfig(
+        type="remote",
+        name="default",
+        budget=1.0,
+        allow_short=any_short,
+        client_id=_COMBINED_AUDIENCE,
+        # url/root_key_fingerprint_ref are only validated at source-BUILD time; the
+        # _FrozenSource is injected directly, so these are never dereferenced here.
+        url="https://retry.local",
+        root_key_fingerprint_ref="RETRY",
     )
     return run_cycle(
         cfg,
@@ -773,4 +1361,5 @@ def retry_attempt(
         as_of=datetime.date.fromisoformat(retry_as_of),
         is_filled=is_filled,
         alert_sink=alert_sink,
+        sleeve_configs=[retry_sleeve],
     )

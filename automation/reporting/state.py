@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pydantic
 
@@ -89,6 +90,41 @@ class State(pydantic.BaseModel):
     inter-attempt interval gate."""
     retry_attempt_count: int = 0
     """Number of retry attempts made in the current window (telemetry / alert)."""
+    recheck_as_of: str | None = None
+    """ISO date of the as_of with an OPEN no-signal re-check window (None = IDLE).
+    Set on a no-good-signal HOLD when ``signal_recheck.enabled``; the daemon
+    re-fires the same as_of on a bounded cadence until a non-hold outcome or
+    expiry (SP3 §5)."""
+    recheck_window_start: str | None = None
+    """ISO UTC timestamp when the re-check window opened (first hold)."""
+    recheck_last_attempt: str | None = None
+    """ISO UTC timestamp of the most recent re-check attempt (gates cadence)."""
+    recheck_attempt_count: int = 0
+    """Re-check attempts in the current window (telemetry / alert context)."""
+    recheck_exhausted_as_of: str | None = None
+    """ISO date whose re-check window EXPIRED (deliberately consumed) — boot
+    crash-detection must not WARN for this day."""
+    sleeves: dict[str, dict[str, Any]] = pydantic.Field(default_factory=dict)
+    """Per-sleeve ledger (CRASH Phase 1, spec §4.2).  Maps each sleeve ``name``
+    to its last-serve record:
+    ``{"last_weights": dict[str, float], "last_as_of": str, "last_success_ts": str,
+    "consecutive_holds": int}``.  ``last_weights`` are SIGNED, sleeve-relative
+    weights (negative entries for short sleeves).  Written on each sleeve's
+    successful serve; this replaces the single global ``last_successful_signal_ts``
+    staleness anchor with a PER-SLEEVE clock (the global field remains for the
+    legacy single-source path).  ``consecutive_holds`` counts consecutive daily
+    HOLDs since the last fresh serve — a short sleeve de-risks (STALE) after the
+    second consecutive HOLD (spec §4.3, red-team H2).  Empty ``{}`` until any
+    sleeve has served; LEGACY state files without this key load with ``{}``
+    (NO migration — red-team H7)."""
+    liq_cooldowns: dict[str, str] = pydantic.Field(default_factory=dict)
+    """Post-liquidation re-entry cooldown map (CRASH Phase 1, spec §5/M3).
+    Maps a ``coin`` to the ISO date (``"YYYY-MM-DD"``) on which an apparent
+    liquidation (position present in the baseline but absent from the live
+    snapshot with no committed exit order) was detected.  Same-direction
+    re-entries for that coin are skipped until ``liquidation_cooldown_days``
+    elapse.  Empty ``{}`` by default; LEGACY state files without this key load
+    with ``{}`` (NO migration — red-team H7)."""
 
 
 def load(path: str | Path) -> State:

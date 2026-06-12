@@ -2518,3 +2518,59 @@ class TestRetryAttempt:
         assert report.exec_report.n_filled == 1
         assert report.committed is True
         assert report.target_weights == {"TON": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Remote model_rev pin (NOGATE-protection for remote sources)
+# ---------------------------------------------------------------------------
+
+
+class _PinnedSource:
+    """Valid-allocation source with a configurable model_rev."""
+
+    def __init__(self, model_rev: str) -> None:
+        self._model_rev = model_rev
+
+    def get_target_allocation(self, as_of: Any = None) -> TargetAllocation:
+        return TargetAllocation(
+            as_of=datetime.date(2026, 6, 1),
+            weights={"BTC": 0.5},
+            cash=0.5,
+            strategy_id="haarp",
+            model_rev=self._model_rev,
+            schema_version=1,
+            audience="test-client",
+        )
+
+
+class TestModelRevPin:
+    """cfg.pinned_model_rev, when set, must match the served allocation's
+    model_rev — the client-side defense that a NOGATE-TEST (ungated) signal
+    can never be consumed by a deployment pinned to the production rev."""
+
+    def _run(self, tmp_path: Any, *, pin: str | None, served: str) -> tuple[Any, _CapturingAlertSink]:
+        cfg = _cfg().model_copy(update={"pinned_model_rev": pin})
+        source = _PinnedSource(served)
+        client = FakeClient()
+        state = State(last_successful_signal_ts=_1D_AGO)
+        sink = _CapturingAlertSink()
+        report = run_cycle(
+            cfg, client, source, IntentLedger(tmp_path / "ledger.json"),
+            state, tmp_path / "state.json",
+            now_ts=_NOW_TS, alert_sink=sink,
+        )
+        return report, sink
+
+    def test_pin_mismatch_is_invalid_signal_hold(self, tmp_path: Any) -> None:
+        report, sink = self._run(tmp_path, pin="0c6021efab4711a1", served="0c6021efab4711a1-NOGATE-TEST")
+        assert report.signal_ok is False
+        assert report.committed is False
+        assert any(a.type == AlertType.INVALID_SIGNAL for a in sink.received)
+
+    def test_pin_match_accepts(self, tmp_path: Any) -> None:
+        report, _ = self._run(tmp_path, pin="rev-A", served="rev-A")
+        assert report.signal_ok is True
+
+    def test_no_pin_accepts_any_rev(self, tmp_path: Any) -> None:
+        report, _ = self._run(tmp_path, pin=None, served="whatever-rev")
+        assert report.signal_ok is True

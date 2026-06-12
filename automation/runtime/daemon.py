@@ -68,6 +68,7 @@ from automation.runtime.scheduler import (
     expected_as_of,
     retry_window_expired,
     should_fire,
+    should_recheck_signal,
     should_retry,
 )
 
@@ -117,6 +118,32 @@ def backfill_fills(
         new_fills.append(fill)
 
     return new_fills, updated
+
+
+# ---------------------------------------------------------------------------
+# SP3 §5 — no-signal re-check trigger predicate
+# ---------------------------------------------------------------------------
+
+
+def _is_no_signal_hold(report: CycleReport | None) -> bool:
+    """True iff the cycle was a NO-GOOD-SIGNAL HOLD (SP3 §5 re-check trigger):
+    uncommitted, zero orders structurally (``exec_report is None`` — the
+    executor was never reached), signal not ok, and NOT an MF-9 defer (which
+    has its own restore).
+
+    The shape is matched EXACTLY so nothing else can sneak in: the exception
+    path's minimal CycleReport keeps ``signal_ok=True``, so an errored cycle
+    is never mistaken for a hold (its day stays consumed — F1's error-loop
+    protection); a de-risk carries ``committed=True`` (that day ACTED); a
+    good-signal hold ("no rebalance needed") carries ``signal_ok=True``.
+    """
+    return (
+        report is not None
+        and not report.committed
+        and report.exec_report is None
+        and not report.signal_ok
+        and not getattr(report, "deferred", False)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +208,25 @@ class Daemon:
     # backwards-compatible default for --once/--dry-run and every existing
     # construction site; only the FOREVER path wires one in).
     heartbeat: Heartbeat | None = None
+    # CRASH Phase 1 multi-sleeve (spec §4): the per-sleeve allocation sources keyed
+    # by sleeve name (``build_sources(cfg)``).  When ``None`` (every existing
+    # construction site / test that injects only ``source=``), ``run_once`` derives
+    # the singular ``{"default": self.source}`` dict so the legacy single-source
+    # path is byte-compatible.  When set (the rewired ``build_daemon``), it is the
+    # dict ``run_cycle`` iterates as ``cfg.sleeves()``.  ``self.source`` is retained
+    # as the "default" sleeve's source for ``dry_run`` and the ``source=`` injection
+    # contract used by the closed HAARP composition root.
+    sources: dict[str, Any] | None = None
     # Arming-edge guard for the daemon's own "armed" CRITICAL alert ONLY.
     # The FLATTEN runs on EVERY armed tick (so a position appearing while armed —
     # or a fast remove+recreate of the flag between ticks — is always closed; see
     # K2/K3).  This flag only edge-gates the alert to avoid per-tick alert spam.
     # Reset to False on a disarmed tick so a re-arm re-emits the arming alert.
     _kill_handled: bool = dataclasses.field(default=False, init=False)
+    # SP3 §5 boot crash-detection — run the "day consumed without a recorded
+    # rebalance" check ONCE per process (on the first live tick), not per tick.
+    # Detection only; never re-fires (fail-safe wins over availability).
+    _recheck_boot_checked: bool = dataclasses.field(default=False, init=False)
 
     def _kill_armed(self) -> bool:
         """Return True if the Tier-1 kill flag file currently exists.
@@ -253,7 +293,14 @@ class Daemon:
             emit AGENT_EXPIRY CRITICAL and return ``None`` without consuming
             the day's ``as_of``.  Trading resumes cleanly after the operator
             rotates the agent and updates ``cfg.agent_valid_until_ms``.
-        1. ``should_fire`` — decide whether a new cycle is due.
+        1. ``should_fire`` — decide whether a new cycle is due.  (Preceded by
+           a once-per-process SP3 §5 boot crash-detection WARN: a day consumed
+           with no recorded rebalance, no open windows and no deliberate
+           recheck expiry is flagged to the operator — detect only, no re-fire.)
+        1c. SP3 §5 re-check gate — when a no-signal re-check window is open
+           for THIS as_of (the post-hold restore re-armed ``should_fire``):
+           window expiry consumes the day for real (CRITICAL alert); the
+           cadence gate throttles re-fires to ``signal_recheck.interval_seconds``.
         2. Mark-scheduled FIRST — persist ``state.last_scheduled_as_of`` to disk
            BEFORE the cycle runs.  This is the crash-safe idempotency guarantee
            (F1): a hard process death (SIGKILL/OOM/power loss) mid-cycle then
@@ -385,6 +432,42 @@ class Daemon:
             )
             return None
 
+        # ------------------------------------------------------------------
+        # SP3 §5 — boot crash-detection (DETECT ONLY, never auto-re-fire).
+        # A hard kill between Step 2's persist (last_scheduled_as_of = as_of)
+        # and the post-hold restore below leaves the day consumed with NO
+        # recheck state on disk — a marker that is INDISTINGUISHABLE from a
+        # crash MID-SUBMIT.  Auto-re-firing the latter would gut F1's crash
+        # guarantee (delta-sizing is the structural backstop, not a license
+        # to bypass F1), so we only WARN: the operator can inspect the audit
+        # log and clear last_scheduled_as_of to re-fire if it really was a
+        # dropped no-signal cycle.  Fail-safe wins over availability.
+        # A day consumed by a DELIBERATE window expiry is recorded in
+        # recheck_exhausted_as_of and is never alerted as a crash.  Open
+        # retry/recheck windows have their own recovery paths → excluded.
+        # Checked ONCE per process, on the first tick that reaches scheduling.
+        # ------------------------------------------------------------------
+        if not self._recheck_boot_checked:
+            self._recheck_boot_checked = True
+            exp = expected_as_of(now, self.cfg.rebalance_utc_time)
+            if (
+                self.cfg.signal_recheck.enabled
+                and self.state.last_scheduled_as_of is not None
+                and self.state.last_scheduled_as_of == exp
+                and self.state.last_rebalanced_as_of != self.state.last_scheduled_as_of
+                and self.state.retry_as_of is None
+                and self.state.recheck_as_of is None
+                and self.state.recheck_exhausted_as_of != self.state.last_scheduled_as_of
+            ):
+                self._emit(
+                    AlertType.DAEMON_RESTART,
+                    Severity.WARNING,
+                    "day consumed without a recorded rebalance — possible "
+                    "crash-dropped cycle; operator may clear "
+                    "last_scheduled_as_of to re-fire",
+                    {"suspect_dropped_as_of": self.state.last_scheduled_as_of},
+                )
+
         fire, as_of = should_fire(
             now, self.state.last_scheduled_as_of, self.cfg.rebalance_utc_time
         )
@@ -397,6 +480,62 @@ class Daemon:
             return self._maybe_retry(now, now_ts)
 
         assert as_of is not None  # guaranteed when fire=True
+
+        # ------------------------------------------------------------------
+        # SP3 §5 — no-signal RE-CHECK gate.  This cannot live in should_fire:
+        # should_fire is pure and cannot see recheck state.  An open re-check
+        # window for THIS as_of means the post-hold restore below re-armed
+        # should_fire, so EVERY tick lands here — without this gate the daemon
+        # would re-fire run_cycle every tick, hammering the signal server and
+        # the HAARP build.  Decision order:
+        #   1. Expiry FIRST, and it is authoritative (>= semantics via
+        #      retry_window_expired; should_recheck_signal's internal window
+        #      check uses > as a backstop only) → consume the day FOR REAL,
+        #      stamp recheck_exhausted_as_of (so boot crash-detection knows
+        #      this day was DELIBERATELY consumed, not crash-dropped), clear
+        #      the window, CRITICAL alert.  From here the normal staleness
+        #      machinery owns the situation (HOLD → de-risk at
+        #      max_signal_staleness_days).
+        #   2. Cadence gate (pure) → hold until interval_seconds elapsed since
+        #      the last attempt: no mark, no cycle, return None.
+        #   3. Otherwise fall through — this tick RE-FIRES the cycle for as_of.
+        # ------------------------------------------------------------------
+        if self.state.recheck_as_of == as_of:
+            if retry_window_expired(
+                now,
+                self.state.recheck_window_start,
+                self.cfg.signal_recheck.window_seconds,
+            ):
+                attempts = self.state.recheck_attempt_count
+                self.state.last_scheduled_as_of = as_of
+                self.state.recheck_exhausted_as_of = as_of
+                self._clear_recheck()
+                save(self.state, self.state_path)
+                _logger.error(
+                    "daemon.run_once: signal re-check window EXHAUSTED — day consumed",
+                    as_of=as_of,
+                    attempts=attempts,
+                )
+                self._emit(
+                    AlertType.SIGNAL_RECHECK_EXHAUSTED,
+                    Severity.CRITICAL,
+                    "signal re-check window expired without a good signal — day consumed",
+                    {
+                        "as_of": as_of,
+                        "attempts": attempts,
+                        "window_seconds": self.cfg.signal_recheck.window_seconds,
+                    },
+                )
+                return None
+            if not should_recheck_signal(
+                now=now,
+                recheck_as_of=self.state.recheck_as_of,
+                recheck_window_start=self.state.recheck_window_start,
+                recheck_last_attempt=self.state.recheck_last_attempt,
+                interval_seconds=self.cfg.signal_recheck.interval_seconds,
+                window_seconds=self.cfg.signal_recheck.window_seconds,
+            ):
+                return None  # hold: cadence not yet elapsed — no mark, no cycle
 
         # ------------------------------------------------------------------
         # Step 1b (C1): SUPERSEDE a stale retry window for a DIFFERENT as_of.
@@ -419,6 +558,38 @@ class Daemon:
                 new_as_of=as_of,
             )
             self._clear_retry()
+            save(self.state, self.state_path)
+
+        # ------------------------------------------------------------------
+        # SP3 §5 — SUPERSEDE a stale RE-CHECK window for a DIFFERENT as_of
+        # (the recheck analog of Step 1b above).  A new daily cycle is firing
+        # for ``as_of``; a window still open for a PRIOR day is cleared AND
+        # persisted HERE — BEFORE Step 2 / run_cycle — for two reasons:
+        #   (a) the boot crash-detection marker above requires
+        #       ``recheck_as_of is None``: a hard kill inside the new day's
+        #       run_cycle with yesterday's window still ON DISK would suppress
+        #       the crash-dropped-day WARN on reboot.  Clearing first means
+        #       the on-disk state during the cycle is detection-clean.
+        #   (b) window hygiene: a new day's mark must never coexist on disk
+        #       with yesterday's window clock — recheck state is only
+        #       meaningful for the as_of it was opened on.
+        # Note this is NOT about instant expiry: the gate above only checks
+        # expiry when ``recheck_as_of == as_of``, and the hold block below
+        # always fresh-opens on a mismatch — an inherited clock can never
+        # consume the new day.  ``!= as_of`` also never clears a LIVE window:
+        # a same-as_of re-fire flows through the gate with its window intact
+        # (== skips this block), so any window matching here is necessarily
+        # yesterday's.  recheck_exhausted_as_of is deliberately NOT touched —
+        # it is history for boot crash-detection, not live window state.
+        # ------------------------------------------------------------------
+        if self.state.recheck_as_of is not None and self.state.recheck_as_of != as_of:
+            _logger.warning(
+                "daemon.run_once: superseding stale signal re-check window — "
+                "new daily cycle",
+                old_as_of=self.state.recheck_as_of,
+                new_as_of=as_of,
+            )
+            self._clear_recheck()
             save(self.state, self.state_path)
 
         # ------------------------------------------------------------------
@@ -451,7 +622,12 @@ class Daemon:
             report = _rebalance_mod.run_cycle(
                 self.cfg,
                 self.client,
-                self.source,
+                # Multi-sleeve dict when wired (build_daemon); else the singular
+                # {"default": self.source} from the injected single source (byte-
+                # compatible with every existing construction site / test).
+                self.sources
+                if self.sources is not None
+                else {"default": self.source},
                 self.ledger,
                 self.state,
                 self.state_path,
@@ -510,6 +686,81 @@ class Daemon:
             except Exception as exc:  # noqa: BLE001
                 _logger.error(
                     "daemon.run_once: failed to persist defer-retry state restore",
+                    as_of=as_of,
+                    error=str(exc),
+                )
+
+        # ------------------------------------------------------------------
+        # SP3 §5 — no-signal re-check: restore + window open/advance.
+        # A NO-GOOD-SIGNAL HOLD must NOT consume the day: the signal may land
+        # minutes later (e.g. the server publishing late) while Step 2 above
+        # already marked the as_of consumed — without this, a 5-minute publish
+        # delay costs the entire trading day.  We restore the idempotency key
+        # via the MF-9 mechanism, and it is double-trade-safe for the same
+        # structural reason: the hold path submitted ZERO orders (exec_report
+        # is None — the executor was never reached), so re-firing the same
+        # as_of cannot double-trade.  The restore AND the window fields are
+        # persisted in ONE atomic save (State.save is temp+os.replace) —
+        # narrowing the crash window to the seconds run_cycle spends on the
+        # no-signal path; a kill inside that gap is caught by the boot
+        # crash-detection WARN above (detect-only, fail-safe wins).
+        #
+        # MF-9 interaction: a DEFERRED report takes ONLY the MF-9 restore
+        # above and is excluded here BOTH ways — _is_no_signal_hold rejects
+        # deferred=True (no window is opened/advanced for it), and the close
+        # branch below also excludes it (an open window stays UNTOUCHED): a
+        # defer is a rate-budget decision that says NOTHING about signal
+        # availability, so it must neither extend nor end the re-check.  Its
+        # own restore re-fires next tick; that re-fire's DEFINITIVE outcome
+        # (good signal / hold / de-risk) then drives the window.
+        # ------------------------------------------------------------------
+        if self.cfg.signal_recheck.enabled and _is_no_signal_hold(report):
+            self.state.last_scheduled_as_of = prev_scheduled
+            if self.state.recheck_as_of != as_of:
+                # First hold for this as_of → OPEN a fresh window.
+                self.state.recheck_as_of = as_of
+                self.state.recheck_window_start = now_ts
+                self.state.recheck_attempt_count = 0
+            self.state.recheck_last_attempt = now_ts
+            self.state.recheck_attempt_count += 1
+            _logger.info(
+                "daemon.run_once: no-good-signal HOLD — restoring "
+                "last_scheduled_as_of and arming re-check window "
+                "(zero orders submitted → re-fire is double-trade-safe)",
+                as_of=as_of,
+                prev_scheduled=prev_scheduled,
+                attempt=self.state.recheck_attempt_count,
+            )
+            try:
+                save(self.state, self.state_path)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "daemon.run_once: failed to persist recheck restore",
+                    as_of=as_of,
+                    error=str(exc),
+                )
+        elif (
+            report is not None
+            and self.state.recheck_as_of is not None
+            and not getattr(report, "deferred", False)
+        ):
+            # Any DEFINITIVE non-hold outcome CLOSES an open re-check window:
+            # success (committed — the day traded), de-risk (committed=True —
+            # that day ACTED; it must NOT restore), or the exception path
+            # (whose day stays consumed per F1, leaving an open window only
+            # orphaned).  Deferred is excluded per the comment above.
+            _logger.info(
+                "daemon.run_once: re-check window CLOSED — non-hold outcome",
+                as_of=as_of,
+                reason=report.reason,
+                attempts=self.state.recheck_attempt_count,
+            )
+            self._clear_recheck()
+            try:
+                save(self.state, self.state_path)
+            except Exception as exc:  # noqa: BLE001
+                _logger.error(
+                    "daemon.run_once: failed to persist recheck window close",
                     as_of=as_of,
                     error=str(exc),
                 )
@@ -1002,6 +1253,17 @@ class Daemon:
         self.state.retry_window_start = None
         self.state.retry_last_attempt = None
         self.state.retry_attempt_count = 0
+
+    def _clear_recheck(self) -> None:
+        """Reset all no-signal re-check window fields to IDLE (in-memory only).
+
+        ``recheck_exhausted_as_of`` is deliberately preserved — it is history
+        consumed by the boot crash-detection check, not live window state.
+        """
+        self.state.recheck_as_of = None
+        self.state.recheck_window_start = None
+        self.state.recheck_last_attempt = None
+        self.state.recheck_attempt_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
