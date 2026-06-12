@@ -1,0 +1,125 @@
+## hl-allocator — RAILWAY TESTNET config, TWO-SLEEVE form (HAARP 50% + CRASH 50%).
+## NO SECRETS HERE — bearer/fingerprint/agent key are env-var REFS resolved at
+## boot (set as Railway service variables: HL_SIGNAL_BEARER, HL_SIGNAL_BEARER_CRASH,
+## HL_SIGNAL_ROOT_FP, HL_AGENT_KEY). Place at /data/automation.yaml on the volume.
+##
+## DELTA vs the singular config:
+##   * signal_source: → signal_sources: list of two sleeves (budget 0.5 each).
+##   * each sleeve pins its OWN model_rev (per-sleeve pin — a single global pin
+##     can't match both the HAARP NOGATE rev and the CRASH gated rev).
+##   * CRASH sleeve: allow_short=true, longer staleness window (quarterly screener).
+##   * universe_perp_map / tradeable_coins extended with the CRASH watchlist
+##     (WIF, SPX, kPEPE, FARTCOIN) so a CRASH short is not folded to cash by the
+##     local whitelist when CRASH eventually goes risk-on.
+##   * top-level pinned_model_rev REMOVED (each sleeve pins its own).
+##
+## TURNOVER NOTE: HAARP currently serves HYPE ~60.6% (NOGATE). Dropping its budget
+## 1.0 → 0.5 HALVES the HYPE position (→ ~30.3% of equity); CRASH is all-cash
+## (risk-off) so its 50% parks as cash. This is a REAL rebalance, not a no-op.
+
+env: testnet
+trade_mode: master_direct
+subaccount_address: "0xcD0DBC2bE94676160C0A1dE6240B6993Ceb59aD4"  # MASTER
+
+signal_sources:
+  # --- Sleeve 1: HAARP (long-only, 50% of equity) ---------------------------
+  - name: haarp
+    type: remote
+    url: "https://haarp-signal-server-production.up.railway.app/v1/signal"
+    token_ref: "HL_SIGNAL_BEARER"
+    root_key_fingerprint_ref: "HL_SIGNAL_ROOT_FP"
+    client_id: "haarp-testnet-allocator"
+    budget: 0.5
+    allow_short: false
+    pinned_model_rev: "0c6021efab4711a1-NOGATE-TEST"
+    max_signal_staleness_days: 2
+
+  # --- Sleeve 2: CRASH (short-capable, 50% of equity) -----------------------
+  - name: crash
+    type: remote
+    url: "https://haarp-crash-signal-production.up.railway.app/v1/signal"
+    token_ref: "HL_SIGNAL_BEARER_CRASH"
+    root_key_fingerprint_ref: "HL_SIGNAL_ROOT_FP"
+    client_id: "crash-testnet-allocator"
+    budget: 0.5
+    allow_short: true
+    pinned_model_rev: "ee68348fdf62003d"
+    max_signal_staleness_days: 4   # CRASH publishes daily but the quarterly
+                                   # screener boundary can pause it; wider window.
+
+strategy_id: "haarp-multi"
+
+# --- agent key: RAW from env (24/7 unattended; no keystore on Railway) ------
+key_source:
+  type: env_raw
+  env_var: "HL_AGENT_KEY"
+
+# --- runtime state on the volume ---------------------------------------------
+nonce_state_path: "/data/nonce.state"
+state_path: "/data/state.json"
+ledger_path: "/data/ledger.json"
+audit_path: "/data/audit.jsonl"
+kill_flag_path: "/data/KILL"
+
+# --- rebalance cadence / thresholds ------------------------------------------
+rebalance_utc_time: "00:03"
+threshold_pct: 3.0
+safety_buffer: 0.03
+max_signal_staleness_days: 2   # global fallback (each sleeve overrides above)
+
+signal_recheck:
+  enabled: true
+  interval_seconds: 60
+  window_seconds: 7200
+max_per_asset: 0.9
+
+caps:
+  max_notional_per_coin: 10000.0
+  max_total_notional: 50000.0
+  max_turnover_per_cycle: 60000.0
+  max_order_slippage: 0.01
+
+agent_valid_until_ms: 1796426682839
+divergence_alert_pct: 5.0
+
+# NOTE: no top-level pinned_model_rev — each sleeve pins its own rev.
+
+universe_perp_map:
+  # HAARP universe
+  BTC: BTC
+  ETH: ETH
+  SOL: SOL
+  BNB: BNB
+  XMR: XMR
+  DOGE: DOGE
+  TON: TON
+  SUI: SUI
+  HYPE: HYPE
+  AVAX: AVAX
+  ZEC: ZEC
+  PAXG: PAXG
+  # CRASH watchlist (short-capable)
+  WIF: WIF
+  SPX: SPX
+  kPEPE: kPEPE
+  FARTCOIN: FARTCOIN
+
+tradeable_coins:
+  - BTC
+  - ETH
+  - SOL
+  - BNB
+  - XMR
+  - DOGE
+  - TON
+  - SUI
+  - HYPE
+  - AVAX
+  - ZEC
+  - PAXG
+  - WIF
+  - SPX
+  - kPEPE
+  - FARTCOIN
+
+spot_routing: {}
