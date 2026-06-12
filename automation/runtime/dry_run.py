@@ -86,7 +86,11 @@ def dry_run_cycle(
     ta = source.get_target_allocation(as_of)
 
     whitelist = set(cfg.universe_perp_map) if cfg.universe_perp_map else set(ta.weights.keys())
-    client_id = cfg.signal_source.client_id or ""
+    # Multi-sleeve aware: dry_run_cycle processes the REPRESENTATIVE source
+    # (run_daemon passes the "default" sleeve if present, else the first sleeve
+    # in config order — exactly cfg.sleeves()[0]).  Under a signal_sources: list
+    # cfg.signal_source is None, so read the representative sleeve's client_id.
+    client_id = cfg.sleeves()[0].client_id or ""
     validate_target_allocation(
         ta,
         max_per_asset=cfg.max_per_asset,

@@ -46,6 +46,33 @@ def _cfg(client_id: str = "test-client") -> Config:
     )
 
 
+def _two_sleeve_cfg() -> Config:
+    """A two-sleeve config (no singular signal_source): cfg.signal_source is None.
+
+    dry_run_cycle must read the REPRESENTATIVE sleeve's client_id via
+    cfg.sleeves()[0] rather than the (None) cfg.signal_source.
+    """
+    return Config(
+        env="testnet",
+        subaccount_address="0x" + "0" * 40,
+        signal_sources=[
+            SignalSourceConfig(type="equal_weight", name="haarp", client_id="haarp-client", budget=0.5),
+            SignalSourceConfig(type="equal_weight", name="crash", client_id="crash-client", budget=0.5),
+        ],
+        rebalance_utc_time="00:15",
+        threshold_pct=3.0,
+        max_per_asset=0.6,
+        safety_buffer=0.03,
+        universe_perp_map={},
+        caps=CapsConfig(
+            max_notional_per_coin=1_000_000,
+            max_total_notional=10_000_000,
+            max_turnover_per_cycle=5_000_000,
+            max_order_slippage=0.005,
+        ),
+    )
+
+
 def _target(weights: dict[str, float], audience: str = "test-client") -> TargetAllocation:
     cash = 1.0 - sum(weights.values())
     return TargetAllocation(
@@ -127,6 +154,20 @@ class TestDryRunCycle:
         sp = dry_run_cycle(_cfg(), client, source, state)
 
         # Bootstrap state → rebalance should fire
+        assert sp.rebalance is True
+        assert sp.reason == "bootstrap"
+
+    def test_two_sleeve_cfg_uses_representative_client_id(self, tmp_path: Any) -> None:
+        """On a signal_sources: list, cfg.signal_source is None — dry_run_cycle
+        must read the representative sleeve's client_id (cfg.sleeves()[0]) and
+        NOT crash with AttributeError. The served audience matches sleeve 0."""
+        ta = _target({"BTC": 0.5, "ETH": 0.5}, audience="haarp-client")
+        source = FakeSource(ta)
+        client = FakeClient()
+        state = State()
+
+        sp = dry_run_cycle(_two_sleeve_cfg(), client, source, state)
+
         assert sp.rebalance is True
         assert sp.reason == "bootstrap"
 

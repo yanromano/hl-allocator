@@ -400,7 +400,10 @@ def main(argv: list[str] | None = None) -> int:
         "run_daemon: starting",
         env=cfg.env,
         strategy_id=cfg.strategy_id,
-        signal_source_type=cfg.signal_source.type,
+        # Multi-sleeve aware: the singular signal_source: surfaces as the lone
+        # "default" sleeve, so cfg.sleeves() covers both forms (the singular
+        # cfg.signal_source is None under a signal_sources: list and crashes).
+        sleeves=[f"{s.name}:{s.type}" for s in cfg.sleeves()],
         once=args.once,
         dry_run=args.dry_run,
         perp_only=not bool(cfg.spot_routing),
