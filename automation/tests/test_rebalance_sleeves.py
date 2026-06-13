@@ -821,6 +821,8 @@ class TestLiquidationDetection:
             last_rebalanced_as_of="2026-06-01",
             first_cycle_ts="2026-06-01T00:00:00+00:00",
             last_successful_signal_ts="2026-06-01T00:00:00+00:00",
+            # TON was ACTUALLY HELD last cycle (live book) — a genuine liquidation.
+            last_known_positions={"TON": -3.0},
         )
         sp = tmp_path / "state.json"
         ledger = IntentLedger(tmp_path / "ledger.json")
@@ -837,6 +839,69 @@ class TestLiquidationDetection:
         assert liq[0].context["coin"] == "TON"
         # Cooldown armed for TON at TODAY's date (now_ts's date).
         assert state.liq_cooldowns["TON"] == "2026-06-02"
+
+    def test_unfilled_target_not_flagged_liquidation(self, tmp_path: Any) -> None:
+        """Baseline {TON:-0.3} but TON was NEVER actually held (absent from
+        last_known_positions) — a committed-but-dropped target, NOT a liquidation.
+        The held_last_cycle guard must NOT arm a phantom cooldown (the stranded-
+        flat-account bug)."""
+        cfg = _two_sleeve_cfg()
+        client = FakeHLClient(
+            equity=100_000.0,
+            positions={},  # TON absent — but it was NEVER held
+            marks=_marks(),
+            sz_decimals=_szd(),
+        )
+        sources = {
+            "haarp": _FakeSource({"BTC": 0.3}, client_id="haarp-client"),
+            "crash": _FakeSource(
+                {"TON": -0.4}, client_id="crash-client", allow_short=True
+            ),
+        }
+        # Baseline records TON:-0.3 (a prior cycle COMMITTED it) but the order was
+        # DROPPED before filling → TON never entered the live book → NOT in
+        # last_known_positions.
+        state = State(
+            last_rebalanced_target={"BTC": 0.0, "TON": -0.3},
+            last_rebalanced_as_of="2026-06-01",
+            first_cycle_ts="2026-06-01T00:00:00+00:00",
+            last_successful_signal_ts="2026-06-01T00:00:00+00:00",
+            last_known_positions={},  # TON NEVER held
+        )
+        sp = tmp_path / "state.json"
+        ledger = IntentLedger(tmp_path / "ledger.json")
+        sink = _RecordingSink()
+
+        run_cycle(
+            cfg, client, sources, ledger, state, sp,
+            now_ts=_NOW, as_of=_AS_OF, alert_sink=sink,
+        )
+
+        # NO phantom liquidation: the never-filled target must not arm a cooldown.
+        assert _alerts_of(sink, AlertType.POSITION_LIQUIDATED) == []
+        assert "TON" not in state.liq_cooldowns
+
+    def test_last_known_positions_recorded_from_snapshot(self, tmp_path: Any) -> None:
+        """run_cycle records the live book into state.last_known_positions for the
+        NEXT cycle's liquidation detection (perp → szi, zeros dropped)."""
+        cfg = _two_sleeve_cfg()
+        client = FakeHLClient(
+            equity=100_000.0,
+            positions={"BTC": 0.5, "ETH": 0.0},  # BTC held, ETH flat
+            marks=_marks(),
+            sz_decimals=_szd(),
+        )
+        sources = {
+            "haarp": _FakeSource({"BTC": 0.3}, client_id="haarp-client"),
+            "crash": _FakeSource({}, client_id="crash-client", allow_short=True),
+        }
+        state = State(first_cycle_ts="2026-06-01T00:00:00+00:00")
+        run_cycle(
+            cfg, client, sources, IntentLedger(tmp_path / "ledger.json"),
+            state, tmp_path / "state.json", now_ts=_NOW, as_of=_AS_OF,
+            alert_sink=_RecordingSink(),
+        )
+        assert state.last_known_positions == {"BTC": 0.5}  # ETH (0.0) dropped
 
     def test_normal_exit_not_flagged_liquidation(self, tmp_path: Any) -> None:
         """We targeted TON→0 last cycle and it filled (so baseline records TON:0.0);

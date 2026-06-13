@@ -126,6 +126,19 @@ class State(pydantic.BaseModel):
     elapse.  Empty ``{}`` by default; LEGACY state files without this key load
     with ``{}`` (NO migration — red-team H7)."""
 
+    last_known_positions: dict[str, float] = pydantic.Field(default_factory=dict)
+    """The live position book (PERP → szi) observed on the PRIOR cycle's snapshot.
+
+    The liquidation detector (``_detect_liquidations``) arms a re-entry cooldown
+    ONLY for a coin that was ACTUALLY HELD last cycle (present here, nonzero) and
+    has now vanished from the live book — NOT merely present in the (target)
+    baseline.  Without this guard a target that was committed but NEVER FILLED
+    (e.g. a cycle dropped mid-flight before its buy landed) would masquerade as a
+    liquidation, arm a phantom cooldown, and strand the account flat (the coin is
+    then excluded from BOTH the ratchet and the abs-drift backstop -> never
+    re-entered).  Recorded every cycle from ``snap.positions``.  Empty ``{}`` by
+    default; LEGACY state files without this key load with ``{}`` (NO migration)."""
+
 
 def load(path: str | Path) -> State:
     """Load State from *path*.

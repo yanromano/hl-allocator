@@ -526,9 +526,18 @@ def _detect_liquidations(
         perp = cfg.universe_perp_map.get(ticker, ticker)
         live = snap.positions.get(perp)
         live_f = float(live) if live is not None else 0.0
-        if live_f == 0.0:
-            # Baseline says we hold it; the book says we don't, and we issued no
-            # order to flatten it → liquidated.
+        # ACTUALLY-HELD guard: a genuine liquidation requires the coin to have
+        # been in the live book LAST cycle (state.last_known_positions, nonzero).
+        # A target committed but NEVER FILLED (e.g. a cycle dropped mid-flight
+        # before its buy landed) carries a nonzero baseline against a flat book
+        # too — without this guard it would masquerade as a liquidation, arm a
+        # phantom cooldown, and STRAND the account flat (the coin is then excluded
+        # from BOTH the ratchet and the abs-drift backstop → never re-entered).
+        prior = state.last_known_positions.get(perp)
+        held_last_cycle = prior is not None and float(prior) != 0.0
+        if live_f == 0.0 and held_last_cycle:
+            # We ACTUALLY held it last cycle, the book is flat for it now, and we
+            # issued no order to flatten it → liquidated.
             state.liq_cooldowns[ticker] = today_iso
             newly_flagged.append(ticker)
             _emit_alert(
@@ -719,6 +728,17 @@ def run_cycle(
         state_path=state_path,
         alert_sink=alert_sink,
     )
+
+    # Record the live book (PERP → szi) for the NEXT cycle's liquidation detector:
+    # a coin is treated as liquidated only if it was ACTUALLY held here, not merely
+    # targeted (see State.last_known_positions / the held_last_cycle guard above).
+    # Captured AFTER _detect_liquidations, which must read the PRIOR cycle's value.
+    # Persisted by this cycle's later state save (commit / hold path).
+    state.last_known_positions = {
+        perp: float(szi)
+        for perp, szi in snap.positions.items()
+        if float(szi) != 0.0
+    }
 
     # Normalize the source argument: the legacy single-source positional binds to a
     # one-element {"default": source} dict (byte-compatible with every existing
