@@ -53,6 +53,7 @@ from typing import Any
 
 from automation.core.config import Config
 from automation.core.redaction import get_logger
+from automation.core.timeutil import parse_utc
 from automation.execution import reconciler
 from automation.execution.executor import make_cloid
 from automation.monitoring.position_health import assess, gather_health_snapshot
@@ -1300,9 +1301,7 @@ class Daemon:
             return (False, None)
 
         # Parse now_ts; treat naive timestamps as UTC.
-        now_dt = datetime.datetime.fromisoformat(now_ts.replace("Z", "+00:00"))
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=datetime.UTC)
+        now_dt = parse_utc(now_ts)
 
         days_remaining = (agent_valid_until_ms / 1000.0 - now_dt.timestamp()) / 86400.0
         expired = days_remaining <= 0

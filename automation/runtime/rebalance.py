@@ -45,6 +45,7 @@ from automation.allocation.sleeves import (
 )
 from automation.core.config import Config, SignalSourceConfig
 from automation.core.redaction import get_logger
+from automation.core.timeutil import parse_utc
 from automation.execution import reconciler, sizer
 from automation.execution.executor import ExecReport, execute
 from automation.reporting.alerts import Alert, AlertSink, AlertType, Severity
@@ -218,12 +219,8 @@ def _handle_no_good_signal(
     # written tz-aware (daemon passes ``now.isoformat()``), but a legacy or
     # hand-edited state file could carry a NAIVE anchor — subtracting aware−naive
     # raises TypeError.  Coerce naive → UTC for both (mirrors ``daemon.boot``).
-    now_dt = datetime.datetime.fromisoformat(now_ts)
-    if now_dt.tzinfo is None:
-        now_dt = now_dt.replace(tzinfo=datetime.UTC)
-    anchor_dt = datetime.datetime.fromisoformat(anchor)
-    if anchor_dt.tzinfo is None:
-        anchor_dt = anchor_dt.replace(tzinfo=datetime.UTC)
+    now_dt = parse_utc(now_ts)
+    anchor_dt = parse_utc(anchor)
     age_days = (now_dt - anchor_dt).total_seconds() / 86400.0
 
     if age_days > cfg.max_signal_staleness_days:
@@ -435,12 +432,8 @@ def _within_staleness_window(
     """
     rec = state.sleeves.get(sleeve.name) or {}
     anchor: str = rec.get("last_success_ts") or state.first_cycle_ts or now_ts
-    now_dt = datetime.datetime.fromisoformat(now_ts)
-    if now_dt.tzinfo is None:
-        now_dt = now_dt.replace(tzinfo=datetime.UTC)
-    anchor_dt = datetime.datetime.fromisoformat(anchor)
-    if anchor_dt.tzinfo is None:
-        anchor_dt = anchor_dt.replace(tzinfo=datetime.UTC)
+    now_dt = parse_utc(now_ts)
+    anchor_dt = parse_utc(anchor)
     age_days = (now_dt - anchor_dt).total_seconds() / 86400.0
     return bool(age_days <= cfg.effective_staleness_days(sleeve))
 
@@ -1017,9 +1010,7 @@ def run_cycle(
     # FORENSIC STAMP (observability only, NO ALERT): how stale the served bar was,
     # in whole days = (now.date() - ta.as_of).days.  ``now_ts`` is ISO (possibly
     # naive → coerce to UTC, mirroring _handle_no_good_signal).
-    now_dt_good = datetime.datetime.fromisoformat(now_ts)
-    if now_dt_good.tzinfo is None:
-        now_dt_good = now_dt_good.replace(tzinfo=datetime.UTC)
+    now_dt_good = parse_utc(now_ts)
     data_age_days = (now_dt_good.date() - ta.as_of).days
 
     # Step 5: Size plan — ONE combined target, allow_short if any sleeve allows it,
